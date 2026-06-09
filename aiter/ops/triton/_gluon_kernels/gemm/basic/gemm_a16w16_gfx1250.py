@@ -1842,6 +1842,10 @@ def gemm_a16w16_gfx1250(
             - BLOCK_K: Tile size in K dimension (default: 32)
             - NUM_BUFFERS: Pipeline stages (default: 2)
             - num_warps: Warps per block (default: 8)
+            - NUM_KSPLIT: K-split count (default: 1). If > 1, the call is routed
+              to the split-K path (partial-sum kernel + reduce) instead of the
+              kernel_type variant -- used to raise occupancy on under-occupied,
+              memory-bound shapes (low M, small N).
         activation: Activation function ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu")
         kernel_type: Kernel variant to use:
             - "auto": Regime-aware dispatch (default) — v9 when M > 512
@@ -1899,6 +1903,32 @@ def gemm_a16w16_gfx1250(
 
     if config is None:
         config, _ = _get_config(M, N, K)
+
+    # Split-K routing: a tuned config may set NUM_KSPLIT > 1 to K-split the
+    # reduction across more CTAs. This is the lever for under-occupied,
+    # memory-bound shapes (low M, small N -- e.g. the gpt-oss router), where the
+    # default grid (cdiv(M,BLOCK_M) * cdiv(N,BLOCK_N)) launches too few CTAs to
+    # approach the HBM-bandwidth floor. The split-K path runs a partial-sum
+    # kernel (grid scaled by the effective split count) plus a reduce pass, and
+    # handles its own K-padding / w transpose, so dispatch to it here before any
+    # padding/transpose below. Bias and activation are applied in the reduce.
+    num_ksplit = config.get("NUM_KSPLIT", 1)
+    if num_ksplit and num_ksplit > 1:
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_splitk_gfx1250 import (  # noqa: E501
+            gemm_a16w16_splitk,
+        )
+
+        y_out, _ = gemm_a16w16_splitk(
+            x,
+            w,
+            num_ksplit,
+            bias=bias,
+            dtype=dtype,
+            y=y,
+            config=config,
+            activation=activation,
+        )
+        return y_out
 
     BLOCK_M = config["BLOCK_M"]
     BLOCK_N = config["BLOCK_N"]
