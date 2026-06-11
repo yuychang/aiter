@@ -93,7 +93,7 @@ def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
     return w
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0)
+@gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0, do_not_specialize=["num_tokens"])
 def _moe_gemm_a8w4_decode(
     Y,
     stride_y_m,
