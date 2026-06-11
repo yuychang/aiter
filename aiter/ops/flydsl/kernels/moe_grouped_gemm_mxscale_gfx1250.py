@@ -778,30 +778,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
-    fused_base = None
-    fused_base_bias = None
-    fused_n = cfg.inter_dim
-    if cfg.split_k == 1:
-        fused_n = (
-            2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
-        )
-        fused_base = _compile_base_a8w4_gemm(
-            K=cfg.model_dim,
-            N=fused_n,
-            cfg=cfg,
-            stage1_act=cfg.act,
-            stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag="gemm1",
-        )
-        fused_base_bias = _compile_base_a8w4_gemm(
-            K=cfg.model_dim,
-            N=fused_n,
-            cfg=cfg,
-            stage1_act=cfg.act,
-            epilogue_bias=True,
-            stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag="gemm1_bias",
-        )
     raw_base = _compile_base_a8w4_gemm(
         K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw"
     )
@@ -844,20 +820,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _debug_tmp_sentinel=None,
         _debug_tmp_out=None,
     ):
-        """If `_gemm_events=(start, end)` is given, those cuda.Events are
-        recorded immediately before / after the GEMM kernel launch only, so the
-        caller can measure pure GEMM device time excluding prefix-sum and
-        gate*act epilogue.
-
-        Diagnostic hooks (off by default):
-          - `_debug_tmp_sentinel`: if set to a float, the intermediate `tmp`
-            buffer is filled with that value BEFORE the GEMM launch. Cells
-            still equal to the sentinel after the launch indicate GEMM did
-            not write them.
-          - `_debug_tmp_out`: a list-like; if provided, the post-GEMM `tmp`
-            (before the silu(gate)*up epilogue) is appended so the caller can
-            inspect raw GEMM output statistics.
-        """
         if (
             int(max_m_arg) != cfg.max_m
             or int(inter_dim_arg) != cfg.inter_dim
@@ -871,135 +833,34 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
-        fused_gemm = fused_base_bias if bias is not None else fused_base
-        use_fused_gemm = (
-            fused_gemm is not None
-            and _tmp is None
-            and not _skip_epilogue
-            and _debug_tmp_sentinel is None
-            and _debug_tmp_out is None
-        )
         tmp = _tmp
-        if not use_fused_gemm:
-            if tmp is None:
-                tmp = torch.empty(
-                    (cfg.experts, cfg.max_m, 2 * cfg.inter_dim),
-                    device=y.device,
-                    dtype=y.dtype,
-                )
-            if _debug_tmp_sentinel is not None:
-                tmp.fill_(float(_debug_tmp_sentinel))
-            if cfg.split_k > 1:
-                tmp.zero_()
-        if cfg.grouped_persistent_m:
-            m_tile_prefix = _m_tile_prefix
-            if m_tile_prefix is None:
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-            m_tile_map = _m_tile_map
-            if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
-            if _gemm_events is not None:
-                _gemm_events[0].record(stream)
-            if use_fused_gemm:
-                if bias is not None:
-                    _run_compiled(
-                        fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
-                        cfg.max_m,
-                        fused_n,
-                        stream,
-                    )
-                else:
-                    _run_compiled(
-                        fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
-                        cfg.max_m,
-                        fused_n,
-                        stream,
-                    )
-            else:
-                _run_compiled(
-                    raw_base,
-                    tmp,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    m_tile_prefix,
-                    m_tile_map,
-                    cfg.max_m,
-                    2 * cfg.inter_dim,
-                    stream,
-                )
-            if _gemm_events is not None:
-                _gemm_events[1].record(stream)
-        else:
-            if _gemm_events is not None:
-                _gemm_events[0].record(stream)
-            if use_fused_gemm:
-                if bias is not None:
-                    _run_compiled(
-                        fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        cfg.max_m,
-                        fused_n,
-                        stream,
-                    )
-                else:
-                    _run_compiled(
-                        fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        cfg.max_m,
-                        fused_n,
-                        stream,
-                    )
-            else:
-                _run_compiled(
-                    raw_base,
-                    tmp,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    cfg.max_m,
-                    2 * cfg.inter_dim,
-                    stream,
-                )
-            if _gemm_events is not None:
-                _gemm_events[1].record(stream)
-        if use_fused_gemm:
-            return y
+        if tmp is None:
+            tmp = torch.empty(
+                (cfg.experts, cfg.max_m, 2 * cfg.inter_dim),
+                device=y.device,
+                dtype=y.dtype,
+            )
+        if _debug_tmp_sentinel is not None:
+            tmp.fill_(float(_debug_tmp_sentinel))
+        if cfg.split_k > 1:
+            tmp.zero_()
+        if _gemm_events is not None:
+            _gemm_events[0].record(stream)
+        _run_compiled(
+            raw_base,
+            tmp,
+            x,
+            w,
+            scale_x,
+            scale_w,
+            masked_m,
+            cfg.max_m,
+            2 * cfg.inter_dim,
+            stream,
+        )
+        if _gemm_events is not None:
+            _gemm_events[1].record(stream)
         if _debug_tmp_out is not None:
-            # Holding a detached reference is enough to keep the per-call tmp
-            # buffer alive for diagnostics; no clone needed.
             _debug_tmp_out.append(tmp.detach())
         if _skip_epilogue:
             return tmp
@@ -1068,13 +929,6 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     base = _compile_base_a8w4_gemm(
         K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2"
     )
-    base_bias = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim,
-        N=cfg.model_dim,
-        cfg=cfg,
-        epilogue_bias=True,
-        kernel_tag="gemm2_bias",
-    )
 
     def launch(
         y,
@@ -1094,8 +948,6 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _m_tile_map=None,
         bias=None,
     ):
-        """If `_gemm_events=(start, end)` is given, record around the GEMM
-        kernel launch only -- excludes prefix-sum prep work."""
         if (
             int(max_m_arg) != cfg.max_m
             or int(model_dim_arg) != cfg.model_dim
@@ -1111,81 +963,22 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             stream = torch.cuda.current_stream()
         if cfg.split_k > 1:
             y.zero_()
-        gemm = base_bias if bias is not None else base
-        if cfg.grouped_persistent_m:
-            m_tile_prefix = _m_tile_prefix
-            if m_tile_prefix is None:
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-            m_tile_map = _m_tile_map
-            if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
-            if _gemm_events is not None:
-                _gemm_events[0].record(stream)
-            if bias is not None:
-                _run_compiled(
-                    gemm,
-                    y,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    bias,
-                    masked_m,
-                    m_tile_prefix,
-                    m_tile_map,
-                    cfg.max_m,
-                    cfg.model_dim,
-                    stream,
-                )
-            else:
-                _run_compiled(
-                    gemm,
-                    y,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    m_tile_prefix,
-                    m_tile_map,
-                    cfg.max_m,
-                    cfg.model_dim,
-                    stream,
-                )
-            if _gemm_events is not None:
-                _gemm_events[1].record(stream)
-        else:
-            if _gemm_events is not None:
-                _gemm_events[0].record(stream)
-            if bias is not None:
-                _run_compiled(
-                    gemm,
-                    y,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    bias,
-                    masked_m,
-                    cfg.max_m,
-                    cfg.model_dim,
-                    stream,
-                )
-            else:
-                _run_compiled(
-                    gemm,
-                    y,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    cfg.max_m,
-                    cfg.model_dim,
-                    stream,
-                )
-            if _gemm_events is not None:
-                _gemm_events[1].record(stream)
+        if _gemm_events is not None:
+            _gemm_events[0].record(stream)
+        _run_compiled(
+            base,
+            y,
+            x,
+            w,
+            scale_x,
+            scale_w,
+            masked_m,
+            cfg.max_m,
+            cfg.model_dim,
+            stream,
+        )
+        if _gemm_events is not None:
+            _gemm_events[1].record(stream)
         return y
 
     return launch

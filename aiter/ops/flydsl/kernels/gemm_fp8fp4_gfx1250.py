@@ -30,6 +30,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 from .gemm_common_gfx1250 import (
+    WGP_BARRIER_ID,
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
