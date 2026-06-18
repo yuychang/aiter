@@ -149,9 +149,6 @@ jobs:
               export AITER_USE_SYSTEM_TRITON=1
               export AITER_TRITON_ONLY=1
               export ENABLE_CK=0
-              python3 -m pip uninstall -y amd-aiter aiter || true
-              python3 -m pip install -r requirements.txt
-              ENABLE_CK=0 PIP_BREAK_SYSTEM_PACKAGES=1 pip install --break-system-packages -e . --no-build-isolation
               python3 -m pip show amd-aiter
               echo "[SKIP] Keeping Triton from the FFM image."
               python3 -m pip show amd-triton triton || true
