@@ -147,6 +147,7 @@ jobs:
               git config --global --add safe.directory /workspace
               echo "aiter checkout: $(git rev-parse HEAD)"
               export AITER_USE_SYSTEM_TRITON=1
+              export AITER_TRITON_ONLY=1
               python3 -m pip uninstall -y amd-aiter aiter || true
               python3 -m pip install -r requirements.txt
               python3 -m pip install -e . --no-build-isolation
