@@ -27,11 +27,6 @@ on:
         required: true
         default: shared/reduced_tests_for_FFM_CI
         type: string
-      aiter_ref:
-        description: Aiter git ref to clone inside the FFM image.
-        required: true
-        default: shared/reduced_tests_for_FFM_CI
-        type: string
 
 permissions:
   contents: read
@@ -43,7 +38,6 @@ concurrency:
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
   FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
-  FFM_AITER_REF: ${{ inputs.aiter_ref || 'shared/reduced_tests_for_FFM_CI' }}
   FFM_TEST: op_tests/triton_tests
 
 jobs:
@@ -143,27 +137,19 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
-            -e FFM_AITER_REF="${FFM_AITER_REF}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /tmp \
             "${FFM_IMAGE}" \
             bash -lc '
               set -euo pipefail
               source /ffm/ffmlite_env.sh
-              rm -rf /tmp/ffm-aiter
-              git clone https://github.com/ROCm/aiter.git /tmp/ffm-aiter
-              cd /tmp/ffm-aiter
-              git fetch --no-tags --depth=1 origin "${FFM_AITER_REF}"
-              git checkout FETCH_HEAD
-              git config --global --add safe.directory /tmp/ffm-aiter
-              echo "aiter checkout: $(git rev-parse HEAD)"
-              rm -rf "${FFM_TEST}"
-              mkdir -p "$(dirname "${FFM_TEST}")"
-              cp -a "/workspace/${FFM_TEST}" "${FFM_TEST}"
+              rm -rf /tmp/ffm-tests
+              mkdir -p /tmp/ffm-tests
+              cp -a /workspace/op_tests /tmp/ffm-tests/op_tests
+              cd /tmp/ffm-tests
               export AITER_USE_SYSTEM_TRITON=1
               export AITER_TRITON_ONLY=1
               export ENABLE_CK=0
-              python3 -m pip install -r requirements.txt
               python3 -m pip show amd-aiter
               echo "[SKIP] Keeping Triton from the FFM image."
               python3 -m pip show amd-triton triton || true
