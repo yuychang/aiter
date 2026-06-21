@@ -34,6 +34,7 @@ BLOCK_SIZE_M = 32
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_USE_OPUS_MOE_STAGE2 = os.environ.get("AITER_USE_OPUS_MOE_STAGE2", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -1987,25 +1988,62 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    metadata.stage2(
-        a2,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_out,
-        topk,
-        w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0)
-            if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
-            else w2_scale
-        ),
-        a2_scale=a2_scale,
-        block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
-        **extra_stage2_args,
-    )
+    stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
+    use_opus_stage2 = False
+    if _USE_OPUS_MOE_STAGE2 and quant_type == QuantType.No and dtype == dtypes.bf16:
+        from aiter.ops.opus.moe_stage2 import can_use_opus_moe_stage2_bf16
+
+        use_opus_stage2 = can_use_opus_moe_stage2_bf16(
+            a2,
+            w2,
+            num_valid_ids,
+            token_num=token_num,
+            topk=topk,
+            block_m=block_size_M,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            has_extra_stage2_args=bool(extra_stage2_args),
+            expert_mask=expert_mask,
+        )
+    if use_opus_stage2:
+        from aiter.ops.opus.moe_stage2 import (
+            opus_moe_stage2_route_reduce_fwd,
+        )
+
+        route_out = torch.empty(
+            (token_num * topk, model_dim), dtype=dtypes.bf16, device=device
+        )
+        opus_moe_stage2_route_reduce_fwd(
+            a2,
+            w2,
+            sorted_ids,
+            stage2_sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            route_out=route_out,
+            out=moe_out,
+            block_m=block_size_M,
+        )
+    else:
+        metadata.stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale=(
+                w2_scale.view(dtypes.fp8_e8m0)
+                if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+                else w2_scale
+            ),
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            sorted_weights=stage2_sorted_weights,
+            **extra_stage2_args,
+        )
 
     return moe_out
 

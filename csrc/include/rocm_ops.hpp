@@ -301,6 +301,21 @@ namespace py = pybind11;
           "graph capture) before capturing graphs that include "     \
           "opus_gemm splitk kernels under TBO.");
 
+#define OPUS_MOE_PYBIND                                                            \
+    m.def("opus_moe_stage2_route_reduce_fwd",                                       \
+          &opus_moe_stage2_route_reduce_fwd,                                        \
+          "Experimental BF16 Opus MoE stage2 route-output plus reduce path",        \
+          py::arg("inter_states"),                                                  \
+          py::arg("w2"),                                                            \
+          py::arg("sorted_token_ids"),                                              \
+          py::arg("sorted_weights"),                                                \
+          py::arg("sorted_expert_ids"),                                             \
+          py::arg("num_valid_ids"),                                                 \
+          py::arg("route_out"),                                                     \
+          py::arg("out"),                                                           \
+          py::arg("block_m") = 256,                                                 \
+          py::arg("kernel_id") = -1)
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
