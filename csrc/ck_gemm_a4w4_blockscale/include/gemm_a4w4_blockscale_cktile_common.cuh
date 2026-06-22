@@ -93,6 +93,8 @@ void TileGemmComputeImpl(const HostArguments& args)
     constexpr bool TransposeC            = false;
     constexpr bool UseStructuredSparsity = false;
 
+    constexpr ck_tile::index_t NumWaveGroups = 1;
+
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
         ck_tile::sequence<GemmConfig::M_Warp_v, GemmConfig::N_Warp_v, GemmConfig::K_Warp_v>,
@@ -100,10 +102,12 @@ void TileGemmComputeImpl(const HostArguments& args)
                           GemmConfig::N_Warp_Tile_v,
                           GemmConfig::K_Warp_Tile_v>>;
 
+    constexpr ck_tile::index_t TileParitionerGroupNum = 8;
+    constexpr ck_tile::index_t TileParitionerM01      = 4;
     using TilePartitioner =
         ck_tile::GemmSpatiallyLocalTilePartitioner<GemmShape,
-                                                   8, // GemmConfig::TileParitionerGroupNum,
-                                                   4>; // GemmConfig::TileParitionerM01>;
+                                                   TileParitionerGroupNum,
+                                                   TileParitionerM01>;
 
     using GemmTraits = ck_tile::TileGemmUniversalTraits<kPadM,
                                                         kPadN,
@@ -115,7 +119,7 @@ void TileGemmComputeImpl(const HostArguments& args)
                                                         TransposeC,
                                                         UseStructuredSparsity,
                                                         false, // persistent,
-                                                        1, // GemmConfig::NumWaveGroups,
+                                                        NumWaveGroups,
                                                         PreshuffleB>;
 
     using PipelineProblem =
@@ -153,16 +157,16 @@ void TileGemmComputeImpl(const HostArguments& args)
                                         GemmConfig::N_Warp_Tile_v,
                                         GemmConfig::K_Warp_Tile_v,
                                         PipelineProblem::TransposeC,
-                                        1,
-                                        false,
-                                        1,
-                                        1,
-                                        false,
-                                        void,
-                                        void,
-                                        false,
-                                        TILE_FP32,
-                                        CDataType>>;
+                                        NumWaveGroups,
+                                        false, // FixedVectorSize
+                                        1, // VectorSizeC
+                                        1, // BlockedXDLN_PerWarp
+                                        UseDoubleSmemBuffer,
+                                        void, // AComputeDataType
+                                        void, // BComputeDataType
+                                        false, // TilesPacked
+                                        TILE_FP32, // CComputeDataType
+                                        CDataType>>; // CShuffleDataType
 
     using Kernel = ck_tile::MxGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue>;
     auto kargs   = Kernel::MakeKernelArgs(args);
@@ -184,7 +188,6 @@ void TileGemmComputeImpl(const HostArguments& args)
 }
 
 template <typename CDataType,
-          bool HasBias,
           typename GemmInstance>
 __forceinline__ torch::Tensor gemm_a4w4_blockscale_cktile_impl(torch::Tensor& XQ,
                                                                torch::Tensor& WQ,
