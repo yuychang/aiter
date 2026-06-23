@@ -61,7 +61,9 @@ def _reference_stage2(
 ) -> torch.Tensor:
     token_num, topk, _ = inter_states.shape
     _, hidden, _ = w2.shape
-    out = torch.zeros(token_num, hidden, dtype=torch.float32, device=inter_states.device)
+    out = torch.zeros(
+        token_num, hidden, dtype=torch.float32, device=inter_states.device
+    )
     for token in range(token_num):
         for slot in range(topk):
             expert = int(topk_ids[token, slot].item())
@@ -148,7 +150,9 @@ def test_opus_moe_stage2_kid1_matches_torch_reference():
         num_valid_ids,
         block_m,
     ) = _balanced_case(seed=18)
-    out = torch.empty(inter_states.shape[0], w2.shape[1], dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(
+        inter_states.shape[0], w2.shape[1], dtype=torch.bfloat16, device="cuda"
+    )
 
     actual = opus_moe_stage2_route_reduce_fwd(
         inter_states,
@@ -234,7 +238,9 @@ def test_opus_moe_stage2_matches_torch_with_aiter_sorting_metadata():
         block_m=block_m,
         kernel_id=1,
     )
-    expected = _reference_stage2(inter_states, w2, topk_ids.to(torch.int64), topk_weights)
+    expected = _reference_stage2(
+        inter_states, w2, topk_ids.to(torch.int64), topk_weights
+    )
 
     assert_close(actual.float(), expected, atol=5e-2, rtol=5e-2)
 
@@ -251,10 +257,13 @@ def test_opus_moe_stage2_hook_matches_default_fused_moe(monkeypatch):
     ).contiguous()
     w1 = (
         0.1
-        * torch.randn(experts, 2 * inter_dim, hidden, dtype=torch.bfloat16, device="cuda")
+        * torch.randn(
+            experts, 2 * inter_dim, hidden, dtype=torch.bfloat16, device="cuda"
+        )
     ).contiguous()
     w2 = (
-        0.1 * torch.randn(experts, hidden, inter_dim, dtype=torch.bfloat16, device="cuda")
+        0.1
+        * torch.randn(experts, hidden, inter_dim, dtype=torch.bfloat16, device="cuda")
     ).contiguous()
     token_idx = torch.arange(token_num, device="cuda").view(-1, 1)
     slot_idx = torch.arange(topk, device="cuda").view(1, -1)

@@ -1180,6 +1180,14 @@ template <typename T, typename = void> struct num_packs { static constexpr int v
 template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
 template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
 
+template <typename T, typename = void> struct packed_storage { using type = remove_cvref_t<T>; };
+template <typename T>
+struct packed_storage<T, std::enable_if_t<is_packs_v<T>>>
+{
+    using type = typename remove_cvref_t<T>::storage;
+};
+template <typename T> using packed_storage_t = typename packed_storage<remove_cvref_t<T>>::type;
+
 template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
 template <> struct sizeof_bits<void> { static constexpr int value = 0; };
 template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
@@ -1646,7 +1654,7 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
-    using scalar_type = typename vector_traits<T>::dtype;
+    using scalar_type = packed_storage_t<typename vector_traits<T>::dtype>;
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
@@ -1880,7 +1888,7 @@ template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, unsigned in
 template<typename T_>
 struct smem {
     using T = remove_cvref_t<T_>;
-    using scalar_type = typename vector_traits<T>::dtype;
+    using scalar_type = packed_storage_t<typename vector_traits<T>::dtype>;
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
@@ -2281,6 +2289,8 @@ struct mfma {
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
 #endif
@@ -2917,8 +2927,10 @@ struct tiled_mma_adaptor : public MMA_ {
     static constexpr index_t tile_n = TILE_N;
     static constexpr index_t tile_k = TILE_K;
 #if OPUS_TILE_CONTAINER == 0
-    using vtype_a = vector_t<typename MMA::dtype_a, expd_m * expd_k * MMA::elem_a>;
-    using vtype_b = vector_t<typename MMA::dtype_b, expd_n * expd_k * MMA::elem_b>;
+    using vtype_a = vector_t<packed_storage_t<typename MMA::dtype_a>,
+                             expd_m * expd_k * MMA::elem_a>;
+    using vtype_b = vector_t<packed_storage_t<typename MMA::dtype_b>,
+                             expd_n * expd_k * MMA::elem_b>;
     using vtype_c = vector_t<typename MMA::dtype_c, expd_m * expd_n * MMA::elem_c>;
 #elif OPUS_TILE_CONTAINER == 1
     using vtype_a = array<typename MMA::vtype_a, expd_m * expd_k>;

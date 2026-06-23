@@ -28,7 +28,6 @@ if str(THIS_DIR) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import aiter  # noqa: E402
 from aiter.fused_moe import moe_sorting  # noqa: E402
 from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
 from aiter.ops.opus.moe_stage2 import opus_moe_stage2_route_reduce_fwd  # noqa: E402
@@ -139,7 +138,9 @@ def _make_data(
     inter_states = torch.randn(
         token, topk, inter, dtype=torch.bfloat16, device="cuda"
     ).contiguous()
-    w2 = torch.randn(experts, hidden, inter, dtype=torch.bfloat16, device="cuda").contiguous()
+    w2 = torch.randn(
+        experts, hidden, inter, dtype=torch.bfloat16, device="cuda"
+    ).contiguous()
 
     token_idx = torch.arange(token, device="cuda").view(-1, 1)
     slot_idx = torch.arange(topk, device="cuda").view(1, -1)
@@ -167,7 +168,9 @@ def _make_data(
     )
 
 
-def _merge_csv(path: str, rows: list[dict], columns: list[str], overwrite: bool) -> None:
+def _merge_csv(
+    path: str, rows: list[dict], columns: list[str], overwrite: bool
+) -> None:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     new_df = pd.DataFrame(rows, columns=columns)
@@ -227,7 +230,9 @@ def main() -> None:
         raise RuntimeError("CUDA/HIP device required")
 
     arch = get_gfx()
-    cu_num = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    cu_num = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     requested_kids = _parse_int_list(args.kids)
     shapes = _load_shapes(args)
 
@@ -263,7 +268,11 @@ def main() -> None:
             sorted_expert_ids,
             num_valid_ids,
         ) = data
-        ref = None if args.no_check else _reference_stage2(inter_states, w2, topk_ids, topk_weights)
+        ref = (
+            None
+            if args.no_check
+            else _reference_stage2(inter_states, w2, topk_ids, topk_weights)
+        )
         key = {
             "arch": arch,
             "cu_num": cu_num,

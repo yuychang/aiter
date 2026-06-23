@@ -6,7 +6,9 @@
 
 #include "../opus_moe_arch.cuh"
 #include "../opus_moe_common.cuh"
+#include "opus_moe_stage2_route_output_reduce_gfx950.cuh"
 #include "a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh"
+#include "a8w4/opus_moe_pipeline_stage2_a8w4_decode_gfx950.cuh"
 #include "opus_moe_stage2_manifest.h"
 
 #include "aiter_hip_common.h"
@@ -49,16 +51,28 @@ inline void opus_moe_stage2_gemmstyle_launch_gfx950(const opus_moe_stage2_kargs&
     opus_moe_stage2_gemmstyle_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(kargs);
 }
 
-inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
-    const opus_moe_stage2_kargs& kargs,
+template<typename Traits>
+inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
+    const opus_moe_stage2_a8w4_kargs& kargs,
     hipStream_t stream)
 {
-    constexpr int block_n = 2048;
-    constexpr int block_threads = 256;
-    dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
-    dim3 block(block_threads);
-    opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950<block_n, block_threads>
-        <<<grid, block, 0, stream>>>(kargs);
+    int route_blocks =
+        (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
+        Traits::B_M;
+    opus_moe_stage2_a8w4_kargs launch_kargs = kargs;
+    launch_kargs.sorted_blocks = route_blocks;
+    if constexpr(Traits::DECODE_PACE_ROUTE_BLOCKS_TO_POW2)
+    {
+        int paced_route_blocks = 1;
+        while(paced_route_blocks < route_blocks)
+            paced_route_blocks <<= 1;
+        route_blocks = paced_route_blocks;
+        launch_kargs.sorted_blocks = route_blocks;
+    }
+    dim3 grid(Traits::DECODE_COL_TILES, route_blocks, 1);
+    dim3 block(Traits::BLOCK_SIZE);
+    opus_moe_stage2_a8w4_decode_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(
+        launch_kargs);
 }
 
 namespace opus_moe_gfx950_detail
@@ -69,11 +83,14 @@ struct OpusMoeStage2TuneEntry
     OpusMoeStage2Bf16Kernel func;
 };
 
-constexpr bool tune_entry_less(const OpusMoeStage2TuneEntry& a,
-                               const OpusMoeStage2TuneEntry& b) noexcept
+struct TuneEntryLess
 {
-    return a.kid < b.kid;
-}
+    template<typename Entry>
+    constexpr bool operator()(const Entry& a, const Entry& b) const noexcept
+    {
+        return a.kid < b.kid;
+    }
+};
 } // namespace opus_moe_gfx950_detail
 
 inline OpusMoeStage2Bf16Kernel opus_moe_stage2_bf16_tune_dispatch_gfx950(int id)
@@ -85,7 +102,7 @@ inline OpusMoeStage2Bf16Kernel opus_moe_stage2_bf16_tune_dispatch_gfx950(int id)
     constexpr size_t kSize = OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP_SIZE;
     static_assert(kSize == sizeof(kTune) / sizeof(kTune[0]));
     const OpusMoeStage2TuneEntry needle{id, nullptr};
-    const auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    const auto it = std::lower_bound(kTune, kTune + kSize, needle, TuneEntryLess{});
     AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ",
                 id,

@@ -21,7 +21,6 @@ from opus_moe_common import (  # noqa: E402
     STAGE2_BF16_KERNELS,
 )
 
-
 MANIFEST_HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -51,8 +50,7 @@ def _emit_manifest_header() -> str:
                 f"{inst.kid}, "
                 f"&{inst.launcher}<"
                 f"{inst.trait}>"
-                "},"
-                + suffix
+                "}," + suffix
             )
     lines.append("\n")
 
@@ -60,12 +58,22 @@ def _emit_manifest_header() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate Opus MoE stage2 dispatch headers")
+    parser = argparse.ArgumentParser(
+        description="Generate Opus MoE stage2 dispatch headers"
+    )
     parser.add_argument("--working_path", required=True)
-    parser.add_argument("--tune_files", default="", help="Accepted for JIT compatibility.")
-    parser.add_argument("--tune_file", default=None, help="Deprecated alias for --tune_files.")
-    parser.add_argument("--arch", default=None, help="Optional arch filter, e.g. gfx950")
-    parser.add_argument("--cu-num", type=int, default=None, help="Optional CU-count filter")
+    parser.add_argument(
+        "--tune_files", default="", help="Accepted for JIT compatibility."
+    )
+    parser.add_argument(
+        "--tune_file", default=None, help="Deprecated alias for --tune_files."
+    )
+    parser.add_argument(
+        "--arch", default=None, help="Optional arch filter, e.g. gfx950"
+    )
+    parser.add_argument(
+        "--cu-num", type=int, default=None, help="Optional CU-count filter"
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.working_path)
