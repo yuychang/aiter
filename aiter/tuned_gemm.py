@@ -339,7 +339,11 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    zero_init: bool = True,
+    out: Optional[Tensor] = None,
 ) -> Tensor:
+    if out is not None:
+        return out
     return torch.empty(
         *A.shape[:-1],
         B.shape[0],
@@ -357,6 +361,8 @@ def gemm_a16w16(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    zero_init: bool = True,
+    out: Optional[Tensor] = None,
 ) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
@@ -387,6 +393,14 @@ def gemm_a16w16(
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
+    if not zero_init:
+        config = {**config, "zero_init": False}
+    caller_out = out
+    if caller_out is not None:
+        config = {
+            **config,
+            "out": caller_out.view(-1, caller_out.size(-1)) if batched else caller_out,
+        }
     out = solfunc(
         inp_view,
         B,
@@ -403,6 +417,9 @@ def gemm_a16w16(
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
+    if caller_out is not None and out.data_ptr() != caller_out.data_ptr():
+        caller_out.copy_(out)
+        out = caller_out
     save_shapes(
         m,
         n,
@@ -562,6 +579,7 @@ def flydsl_gemm(
     out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
         inp,
         weights,
+        out=config.get("out"),
         bias=fused_bias,
         kernel_family=flydsl_config.get("kernel_family"),
         tile_m=flydsl_config["tile_m"],
@@ -580,6 +598,7 @@ def flydsl_gemm(
         b_to_lds=flydsl_config["b_to_lds"],
         b_preshuffle=flydsl_config.get("b_preshuffle", False),
         c_to_lds=flydsl_config.get("c_to_lds", False),
+        zero_init=config.get("zero_init", True),
     )
 
     if bias is not None and fused_bias is None:
@@ -711,6 +730,8 @@ class TunedGemm:
         scale_a: Optional[Tensor] = None,
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
+        zero_init: bool = True,
+        out: Optional[Tensor] = None,
     ):
 
         out = gemm_a16w16(
@@ -721,6 +742,8 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
+            zero_init=zero_init,
+            out=out,
         )
         return out
 
