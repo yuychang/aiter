@@ -197,7 +197,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      AiterDtype dtype, float eps,
                                      int m, int input_n, int n, int out_n,
                                      bool use_1stage,
-                                     bool gemma_norm)
+                                     bool gemma_norm,
+                                     void* shared_inp = nullptr)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -219,7 +220,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             n,                                                   \
             out_n,                                               \
             use_1stage,                                          \
-            gemma_norm);                                         \
+            gemma_norm,                                          \
+            reinterpret_cast<DTYPE*>(shared_inp));                \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -544,6 +546,80 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                  out.data_ptr(), nullptr, w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
     }
+}
+
+void fused_allreduce_rmsnorm_two_input(fptr_t _fa,
+                                       const aiter_tensor_t& routed_inp,
+                                       const aiter_tensor_t& shared_inp,
+                                       const aiter_tensor_t& res_inp,
+                                       const aiter_tensor_t& res_out,
+                                       const aiter_tensor_t& out,
+                                       const aiter_tensor_t& w,
+                                       double eps,
+                                       bool use_1stage,
+                                       bool gemma_norm)
+{
+    HipDeviceGuard device_guard(routed_inp.device_id);
+    auto dtype = routed_inp.dtype();
+    int input_n = (int)routed_inp.size(-1);
+    int n       = (int)w.numel();
+    int m       = (int)(routed_inp.numel() / input_n);
+    int out_n   = (int)out.size(-1);
+    if(routed_inp.device_id != shared_inp.device_id ||
+       routed_inp.device_id != res_inp.device_id ||
+       routed_inp.device_id != res_out.device_id ||
+       routed_inp.device_id != out.device_id ||
+       routed_inp.device_id != w.device_id)
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires all tensors on one device");
+    }
+    if(dtype != shared_inp.dtype() || dtype != res_inp.dtype() ||
+       dtype != res_out.dtype() || dtype != out.dtype() || dtype != w.dtype())
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires matching tensor dtypes");
+    }
+    if(routed_inp.dim() != 2 || shared_inp.dim() != 2 ||
+       routed_inp.size(0) != shared_inp.size(0) ||
+       routed_inp.size(1) != shared_inp.size(1) ||
+       routed_inp.numel() != shared_inp.numel())
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires matching 2-D routed/shared inputs");
+    }
+    if(!routed_inp.is_contiguous() || !shared_inp.is_contiguous())
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires contiguous routed/shared inputs");
+    }
+    if(input_n != n || out_n != n)
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires input/output width == weight width");
+    }
+    if((int)res_inp.size(-1) != n || (int)res_out.size(-1) != n)
+    {
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_two_input requires residual input/output width == weight width");
+    }
+
+    _fused_allreduce_rmsnorm(_fa,
+                             routed_inp.data_ptr(),
+                             res_inp.data_ptr(),
+                             res_out.data_ptr(),
+                             out.data_ptr(),
+                             nullptr,
+                             w.data_ptr(),
+                             dtype,
+                             (float)eps,
+                             m,
+                             input_n,
+                             n,
+                             out_n,
+                             use_1stage,
+                             gemma_norm,
+                             shared_inp.data_ptr());
 }
 
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,

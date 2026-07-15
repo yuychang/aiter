@@ -81,6 +81,29 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_two_input(
+    routed_input_: torch.Tensor,
+    shared_input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _assert_no_custom_group(
+        "tensor_model_parallel_fused_allreduce_rmsnorm_two_input"
+    )
+    return get_tp_group().fused_allreduce_rmsnorm_two_input(
+        routed_input_,
+        shared_input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        gemma_norm=gemma_norm,
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,

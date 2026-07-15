@@ -141,6 +141,19 @@ def fused_allreduce_rmsnorm_fake(
     return out, torch.empty_like(res_inp)
 
 
+def fused_allreduce_rmsnorm_two_input_fake(
+    routed_inp: torch.Tensor,
+    shared_inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(res_inp), torch.empty_like(res_inp)
+
+
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
 def fused_allreduce_rmsnorm_(
     inp: torch.Tensor,
@@ -163,6 +176,32 @@ def fused_allreduce_rmsnorm_(
         eps,
         prefill_support,
         x_pad_to_multiple=x_pad_to_multiple,
+        gemma_norm=gemma_norm,
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_two_input_fake)
+def fused_allreduce_rmsnorm_two_input_(
+    routed_inp: torch.Tensor,
+    shared_inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_two_input_out_place(
+        routed_inp,
+        shared_inp,
+        res_inp,
+        w,
+        eps,
+        prefill_support,
         gemma_norm=gemma_norm,
     )
 
@@ -549,6 +588,27 @@ class GroupCoordinator:
             gemma_norm=gemma_norm,
         )
 
+    def fused_allreduce_rmsnorm_two_input(
+        self,
+        routed_input_: torch.Tensor,
+        shared_input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_two_input_(
+            routed_input_,
+            shared_input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
+            gemma_norm=gemma_norm,
+        )
+
     def fused_allreduce_rmsnorm_quant(
         self,
         input_: torch.Tensor,
@@ -680,6 +740,28 @@ class GroupCoordinator:
             eps,
             prefill_support,
             x_pad_to_multiple=x_pad_to_multiple,
+            gemma_norm=gemma_norm,
+        )
+
+    def _fused_allreduce_rmsnorm_two_input_out_place(
+        self,
+        routed_input_: torch.Tensor,
+        shared_input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_two_input(
+            routed_input_,
+            shared_input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
             gemma_norm=gemma_norm,
         )
 

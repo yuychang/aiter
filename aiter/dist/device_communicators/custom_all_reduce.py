@@ -890,6 +890,51 @@ class CustomAllreduce:
             )
             return out, res_out, scale_out
 
+    def fused_ar_rms_two_input(
+        self,
+        routed_input: torch.Tensor,
+        shared_input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        *,
+        res_out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        w: torch.Tensor,
+        eps: float,
+        registered: bool = False,
+        use_1stage: bool = False,
+        gemma_norm: bool = False,
+    ):
+        if not registered:
+            raise RuntimeError(
+                "two-input fused allreduce+rmsnorm requires IPC-registered graph inputs"
+            )
+        if routed_input.shape != shared_input.shape:
+            raise ValueError(
+                "two-input fused allreduce+rmsnorm requires matching routed/shared shapes"
+            )
+        if routed_input.dtype != shared_input.dtype:
+            raise ValueError(
+                "two-input fused allreduce+rmsnorm requires matching routed/shared dtypes"
+            )
+        if res_out is None:
+            res_out = torch.empty_like(residual_inp)
+        if out is None:
+            out = torch.empty_like(residual_inp)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        ops.fused_allreduce_rmsnorm_two_input(
+            self._ptr,
+            routed_input,
+            shared_input,
+            residual_inp,
+            res_out,
+            out,
+            w,
+            eps,
+            use_1stage,
+            gemma_norm,
+        )
+        return out, res_out
+
     def custom_fused_ar_rms(
         self,
         input: torch.Tensor,
@@ -940,6 +985,42 @@ class CustomAllreduce:
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
             )
+
+    def custom_fused_ar_rms_two_input(
+        self,
+        routed_input: torch.Tensor,
+        shared_input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        use_1stage: bool,
+        gemma_norm: bool = False,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            self.disabled
+            or routed_input.shape != shared_input.shape
+            or routed_input.dtype != shared_input.dtype
+            or not self.should_custom_ar(routed_input)
+            or not self.should_custom_ar(shared_input)
+        ):
+            return None
+        if not self._IS_CAPTURING:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return self.fused_ar_rms_two_input(
+                routed_input,
+                shared_input,
+                residual_inp,
+                w=weight,
+                eps=eps,
+                registered=True,
+                use_1stage=use_1stage,
+                gemma_norm=gemma_norm,
+            )
+        return (
+            torch.zeros_like(residual_inp),
+            torch.zeros_like(residual_inp),
+        )
 
     def custom_fused_ar_rms_packed_input(
         self,

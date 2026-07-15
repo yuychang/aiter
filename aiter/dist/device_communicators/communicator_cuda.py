@@ -414,6 +414,67 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         return out, residual_out
 
+    def fused_allreduce_rmsnorm_two_input(
+        self,
+        routed_input,
+        shared_input,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        supported_tokens = {1, 2, 4, 8, 16, 32}
+        supported = (
+            self.world_size == 4
+            and routed_input.dtype == torch.bfloat16
+            and shared_input.dtype == torch.bfloat16
+            and res_inp_.dtype == torch.bfloat16
+            and weight_.dtype == torch.bfloat16
+            and routed_input.dim() == 2
+            and routed_input.shape == shared_input.shape == res_inp_.shape
+            and routed_input.shape[-1] == weight_.numel() == 7168
+            and routed_input.shape[0] in supported_tokens
+            and routed_input.is_contiguous()
+            and shared_input.is_contiguous()
+            and res_inp_.is_contiguous()
+        )
+        ca_comm = self.ca_comm
+        if (
+            supported
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and hasattr(ca_comm, "custom_fused_ar_rms_two_input")
+        ):
+            # The two-input one-stage kernel replicates routed+shared peer
+            # reads, so the measured crossover is M=8 for TP=4/H=7168.
+            use_1stage = routed_input.shape[0] <= 8
+            fused = ca_comm.custom_fused_ar_rms_two_input(
+                routed_input,
+                shared_input,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                gemma_norm=gemma_norm,
+            )
+            if fused is not None:
+                return fused
+
+        # Explicit compatibility fallback: preserve the local BF16 add before
+        # invoking the existing allreduce+rmsnorm implementation.
+        local_sum = (routed_input.float() + shared_input.float()).to(
+            routed_input.dtype
+        )
+        return self.fused_allreduce_rmsnorm(
+            local_sum,
+            res_inp_,
+            weight_,
+            eps,
+            prefill_support=prefill_support,
+            gemma_norm=gemma_norm,
+        )
+
     def fused_allreduce_rmsnorm_quant(
         self,
         input_,

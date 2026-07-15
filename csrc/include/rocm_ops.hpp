@@ -492,6 +492,18 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"),                                                               \
           py::arg("gemma_norm") = false);                                                      \
+    m.def("fused_allreduce_rmsnorm_two_input",                                                 \
+          &aiter::fused_allreduce_rmsnorm_two_input,                                           \
+          py::arg("_fa"),                                                                      \
+          py::arg("routed_inp"),                                                               \
+          py::arg("shared_inp"),                                                               \
+          py::arg("res_inp"),                                                                  \
+          py::arg("res_out"),                                                                  \
+          py::arg("out"),                                                                      \
+          py::arg("w"),                                                                        \
+          py::arg("eps"),                                                                      \
+          py::arg("use_1stage"),                                                               \
+          py::arg("gemma_norm") = false);                                                      \
     m.def("fused_allreduce_rmsnorm_pad",                                                       \
           &aiter::fused_allreduce_rmsnorm_pad,                                                 \
           py::arg("_fa"),                                                                      \

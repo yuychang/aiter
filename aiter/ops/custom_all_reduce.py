@@ -86,6 +86,21 @@ def fused_allreduce_rmsnorm(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_allreduce_rmsnorm_two_input(
+    _fa: int,
+    routed_inp: torch.Tensor,
+    shared_inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_pad(
     _fa: int,
     inp: torch.Tensor,
