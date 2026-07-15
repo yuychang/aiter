@@ -14,6 +14,14 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
 
+_FUSED_AR_RMS_1STAGE_DEFAULT_MAX_BYTES = 128 * 1024
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+_FUSED_AR_RMS_1STAGE_TUNED_MAX_BYTES = {
+    # Kimi-K2.5/DeepSeek-style hidden size at TP=4: measured crossover keeps
+    # decode and small batched-decode shapes on 1-stage through M=32.
+    (4, 7168): 512 * 1024,
+}
+
 _FUSED_AR_RMS_QUANT_ALIASES = {
     "fp8": "per_token",
     "fp8_per_token": "per_token",
@@ -53,6 +61,44 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
         "unsupported fused AR+RMSNorm quant_type="
         f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
     )
+
+
+def _get_fused_ar_rms_1stage_max_bytes(
+    input_: torch.Tensor,
+    world_size: int,
+) -> int:
+    raw_value = os.environ.get("AITER_FUSED_AR_RMS_1STAGE_MAX_BYTES")
+    if raw_value is not None:
+        try:
+            return int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                "AITER_FUSED_AR_RMS_1STAGE_MAX_BYTES must be an integer, "
+                f"got {raw_value!r}"
+            ) from exc
+    hidden_dim = int(input_.shape[-1])
+    return _FUSED_AR_RMS_1STAGE_TUNED_MAX_BYTES.get(
+        (world_size, hidden_dim), _FUSED_AR_RMS_1STAGE_DEFAULT_MAX_BYTES
+    )
+
+
+def _select_fused_ar_rms_1stage(input_: torch.Tensor, override: bool | None) -> bool:
+    return _select_fused_ar_rms_1stage_for_world_size(input_, override, 0)
+
+
+def _select_fused_ar_rms_1stage_for_world_size(
+    input_: torch.Tensor,
+    override: bool | None,
+    world_size: int,
+) -> bool:
+    hidden_dim = int(input_.shape[-1])
+    token_num = input_.numel() // hidden_dim if hidden_dim > 0 else 0
+    if token_num > _FUSED_AR_RMS_1STAGE_MAX_TOKENS:
+        return False
+    if override is not None:
+        return override
+    max_bytes = _get_fused_ar_rms_1stage_max_bytes(input_, world_size)
+    return input_.numel() * input_.element_size() <= max_bytes
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -277,10 +323,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         can_use_custom_ar = (
             ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
         )
-        use_1stage = (
-            self._ar_1stage_override
-            if self._ar_1stage_override is not None
-            else (total_bytes * self.world_size <= 128 * 7168 * 2)
+        use_1stage = _select_fused_ar_rms_1stage_for_world_size(
+            input_, self._ar_1stage_override, self.world_size
         )
         if (
             not use_general_path
@@ -409,10 +453,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
-            use_1stage = (
-                self._ar_1stage_override
-                if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+            use_1stage = _select_fused_ar_rms_1stage_for_world_size(
+                input_, self._ar_1stage_override, self.world_size
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -458,10 +500,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
-            use_1stage = (
-                self._ar_1stage_override
-                if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+            use_1stage = _select_fused_ar_rms_1stage_for_world_size(
+                input_, self._ar_1stage_override, self.world_size
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(

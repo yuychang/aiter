@@ -63,7 +63,14 @@ def _run_rank(
     benchmark: bool,
     bench_warmup: int,
     bench_iters: int,
+    stage: str,
+    one_stage_max_bytes: int | None,
 ):
+    if stage in ("1stage", "2stage"):
+        os.environ["AITER_AR_1STAGE"] = "1" if stage == "1stage" else "0"
+    if one_stage_max_bytes is not None:
+        os.environ["AITER_FUSED_AR_RMS_1STAGE_MAX_BYTES"] = str(one_stage_max_bytes)
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     set_custom_all_reduce(True)
@@ -121,6 +128,8 @@ def _run_rank(
         row = {
             "shape": shape,
             "rank": rank,
+            "stage": stage,
+            "one_stage_max_bytes": one_stage_max_bytes,
             "max_abs_err": max_abs_err,
             "first_bad": first_bad,
         }
@@ -165,6 +174,18 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--bench-warmup", type=int, default=100)
     parser.add_argument("--bench-iters", type=int, default=500)
+    parser.add_argument(
+        "--stage",
+        choices=["auto", "1stage", "2stage"],
+        default="auto",
+        help="Force AITER fused AR+RMSNorm stage selection, or use auto policy.",
+    )
+    parser.add_argument(
+        "--one-stage-max-bytes",
+        type=int,
+        default=None,
+        help="Override the auto-policy byte cutoff for 1-stage fused AR+RMSNorm.",
+    )
     args = parser.parse_args()
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -184,6 +205,8 @@ def main():
                     args.benchmark,
                     args.bench_warmup,
                     args.bench_iters,
+                    args.stage,
+                    args.one_stage_max_bytes,
                 ),
             )
             for rank in range(args.tp)
