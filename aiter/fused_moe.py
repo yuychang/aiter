@@ -50,6 +50,129 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_FUSED_DECODE_SORT_QUANT_ENV = "SGLANG_AITER_FUSED_DECODE_SORT_QUANT"
+
+
+def _is_fused_decode_sort_quant_enabled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    global_experts: int,
+    block_m: int,
+    quant_type: QuantType,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    activation: ActivationType,
+    is_g1u1: bool,
+    expert_mask: Optional[torch.Tensor],
+    num_local_tokens: Optional[torch.Tensor],
+    need_local_topk_ids: bool,
+    run_1stage: bool,
+    stage1_is_flydsl: bool,
+    hidden_pad: int,
+) -> bool:
+    """Gate the direct-scale HIP route-sort/quant kernel to supported graph decode.
+
+    ``auto`` accepts the two supported routed-MoE shapes. ``1`` is
+    intentionally no broader: it is for profiling/microbench reproducibility,
+    not a generic MXFP4 fallback.
+    """
+    mode = os.environ.get(_FUSED_DECODE_SORT_QUANT_ENV, "").strip().lower()
+    if mode not in ("auto", "1", "true", "on", "yes"):
+        return False
+    expected_topk = {385: 9, 384: 8}.get(global_experts)
+    return (
+        get_gfx() == "gfx950"
+        and hidden_states.dtype == dtypes.bf16
+        and hidden_states.ndim == 2
+        and hidden_states.shape[0] in (1, 2, 4, 8, 16, 32, 64, 128)
+        and hidden_states.shape[1] == 7168
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and expected_topk is not None
+        and topk_ids.shape == (hidden_states.shape[0], expected_topk)
+        and topk_ids.is_contiguous()
+        and topk_weights.dtype == dtypes.fp32
+        and topk_weights.is_contiguous()
+        and block_m == 32
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and is_g1u1
+        and expert_mask is None
+        and num_local_tokens is None
+        and not need_local_topk_ids
+        and not run_1stage
+        and stage1_is_flydsl
+        and hidden_pad == 0
+    )
+
+
+def _fused_decode_sort_quant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    model_dim: int,
+    global_experts: int,
+    block_m: int,
+    moebuf_dtype: torch.dtype,
+    accumulate: bool,
+):
+    """Return standard sorted metadata plus the pre-quantized stage-1 input."""
+    device = hidden_states.device
+    tokens = hidden_states.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(global_experts, route_count)
+    max_sorted = (
+        route_count + active_experts * (block_m - 1) + block_m - 1
+    ) // block_m * block_m
+    max_blocks = (max_sorted + block_m - 1) // block_m
+    sorted_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    activation_quant = torch.empty(
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    activation_scale_token = torch.empty(
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+    )
+    activation_scale = mxfp4_moe_sort_fwd(
+        activation_scale_token,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=tokens,
+        cols=model_dim,
+    )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale,
+    )
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -515,21 +638,62 @@ def fused_moe_(
     assert (
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
-    sorting_ret = moe_sorting(
+    fused_sort_quant = _is_fused_decode_sort_quant_enabled(
+        hidden_states,
         topk_ids,
         topk_weight,
-        global_E,
-        model_dim,
-        dtype,
-        block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
-        return_local_topk_ids=need_local_topk_ids,
-        accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
-        flat=metadata.flat,
+        global_experts=global_E,
+        block_m=block_size_M,
+        quant_type=quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        activation=activation,
+        is_g1u1=isG1U1,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        need_local_topk_ids=need_local_topk_ids,
+        run_1stage=metadata.run_1stage,
+        stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
+        hidden_pad=hidden_pad,
     )
-    if need_local_topk_ids:
+    if fused_sort_quant:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = _fused_decode_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            model_dim=model_dim,
+            global_experts=global_E,
+            block_m=block_size_M,
+            moebuf_dtype=dtype,
+            accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+        )
+        local_topk_ids = None
+    else:
+        sorting_ret = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+            return_local_topk_ids=need_local_topk_ids,
+            accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+            flat=metadata.flat,
+        )
+        prequantized_a1 = None
+        prequantized_a1_scale = None
+    if not fused_sort_quant and need_local_topk_ids:
         (
             sorted_ids,
             sorted_weights,
@@ -538,7 +702,7 @@ def fused_moe_(
             moe_buf,
             local_topk_ids,
         ) = sorting_ret
-    else:
+    elif not fused_sort_quant:
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             sorting_ret
         )
@@ -602,6 +766,8 @@ def fused_moe_(
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            prequantized_a1=prequantized_a1,
+            prequantized_a1_scale=prequantized_a1_scale,
         )
 
 
@@ -1765,6 +1931,8 @@ def fused_moe_2stages(
     swiglu_limit=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    prequantized_a1: Optional[torch.Tensor] = None,
+    prequantized_a1_scale: Optional[torch.Tensor] = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1794,7 +1962,12 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
     )
-    if (
+    if prequantized_a1 is not None:
+        assert quant_type == QuantType.per_1x32
+        assert prequantized_a1_scale is not None
+        a1 = prequantized_a1
+        a1_scale = prequantized_a1_scale
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2

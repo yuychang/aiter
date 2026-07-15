@@ -34,3 +34,24 @@ def moe_sorting_opus_fwd(
     dispatch_policy: int = 0,
     local_topk_ids: Optional[torch.Tensor] = None,
 ) -> None: ...
+
+
+@compile_ops("module_moe_sorting_opus", develop=True)
+def mxfp4_moe_sort_quant_fwd(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    moe_buf: torch.Tensor,
+    activation_quant: torch.Tensor,
+    activation_scale_token: torch.Tensor,
+) -> None:
+    """Fused route sort + compact MXFP4 activation quantization.
+
+    Supports E=385/top-k=9 with a fused shared expert and E=384/top-k=8 when
+    shared experts are dispatched separately.
+    """
+    ...
