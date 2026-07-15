@@ -366,6 +366,7 @@ def compile_flydsl_moe_stage1(
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
     a_scale_one: bool = False,
+    a_scale_compact: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
 ):
@@ -397,6 +398,7 @@ def compile_flydsl_moe_stage1(
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
+            a_scale_compact=a_scale_compact,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
         )
@@ -1148,6 +1150,7 @@ def flydsl_moe_stage1(
     bias: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
+    a_scale_compact: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: Optional[float] = None,
     k_wave: int = 1,
@@ -1338,6 +1341,7 @@ def flydsl_moe_stage1(
         inter_dim_pad=inter_dim_pad,
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
+        a_scale_compact=a_scale_compact,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
     )

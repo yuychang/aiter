@@ -30,8 +30,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 // activation quantization and routed-output zeroing for
 // H=7168 graph batches M in {1,2,4,8,16,32,64,128}. It supports both
 // E=385/topk=9 (fused shared expert) and E=384/topk=8 (separate shared
-// expert). It emits compact per-token E8M0 scales, which the Python integration
-// converts to the conventional sorted-scale layout before FlyDSL GEMM1.
+// expert). It emits compact per-token E8M0 scales. Supported M>=8 tiers can
+// consume them directly in FlyDSL GEMM1; smaller tiers retain the conventional
+// sorted-scale conversion.
 void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               aiter_tensor_t& topk_ids,
                               aiter_tensor_t& topk_weights,
