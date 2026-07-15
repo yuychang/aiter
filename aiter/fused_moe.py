@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
@@ -50,8 +51,28 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_MOE_VERBOSE_CONFIGS: set[tuple] = set()
 _FUSED_DECODE_SORT_QUANT_ENV = "SGLANG_AITER_FUSED_DECODE_SORT_QUANT"
 _FUSED_DECODE_COMPACT_SCALE_ENV = "SGLANG_AITER_FUSED_DECODE_COMPACT_SCALE"
+
+
+def _profile_range(name: str):
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def _rank0() -> bool:
+    return not (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    )
+
+
+def _callable_name(fn) -> str:
+    fn = getattr(fn, "func", fn)
+    return getattr(fn, "__name__", type(fn).__name__)
 
 
 def _is_fused_decode_sort_quant_enabled(
@@ -147,18 +168,19 @@ def _fused_decode_sort_quant(
     activation_scale_token = torch.empty(
         (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
     )
-    aiter.mxfp4_moe_sort_quant_fwd(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        activation_quant,
-        activation_scale_token,
-    )
+    with _profile_range("aiter_mxfp4_moe_sort_quant"):
+        aiter.mxfp4_moe_sort_quant_fwd(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            activation_quant,
+            activation_scale_token,
+        )
     activation_scale = activation_scale_token
     if not compact_scale:
         activation_scale = mxfp4_moe_sort_fwd(
@@ -200,6 +222,7 @@ def _is_fused_decode_compact_scale_enabled(
         and parsed.get("tile_k") == 256
         and parsed.get("k_batch", 1) == 1
     )
+
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -647,6 +670,29 @@ def fused_moe_(
         gate_mode,
         is_ep=expert_mask is not None,
     )
+    if os.environ.get("SGLANG_ROCM_MOE_VERBOSE", "0") == "1" and _rank0():
+        key = (
+            M,
+            E,
+            topk,
+            str(quant_type),
+            _callable_name(metadata.stage1),
+            _callable_name(metadata.stage2),
+        )
+        if key not in _MOE_VERBOSE_CONFIGS:
+            _MOE_VERBOSE_CONFIGS.add(key)
+            logger.info(
+                "[aiter-moe] M=%s E=%s topk=%s quant=%s "
+                "stage1=%s stage2=%s block_m=%s ksplit=%s",
+                M,
+                E,
+                topk,
+                quant_type,
+                key[-2],
+                key[-1],
+                metadata.block_m,
+                metadata.ksplit,
+            )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -709,20 +755,21 @@ def fused_moe_(
         )
         local_topk_ids = None
     else:
-        sorting_ret = moe_sorting(
-            topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
-            flat=metadata.flat,
-        )
+        with _profile_range("aiter_route_prepare_from_topk"):
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+                flat=metadata.flat,
+            )
         prequantized_a1 = None
         prequantized_a1_scale = None
     if not fused_sort_quant and need_local_topk_ids:
@@ -2021,6 +2068,29 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
     )
+    if os.environ.get("SGLANG_ROCM_MOE_VERBOSE", "0") == "1" and _rank0():
+        key = (
+            token_num,
+            E,
+            topk,
+            str(quant_type),
+            _callable_name(metadata.stage1),
+            _callable_name(metadata.stage2),
+        )
+        if key not in _MOE_VERBOSE_CONFIGS:
+            _MOE_VERBOSE_CONFIGS.add(key)
+            logger.info(
+                "[aiter-moe] M=%s E=%s topk=%s quant=%s "
+                "stage1=%s stage2=%s block_m=%s ksplit=%s",
+                token_num,
+                E,
+                topk,
+                quant_type,
+                key[-2],
+                key[-1],
+                metadata.block_m,
+                metadata.ksplit,
+            )
     if prequantized_a1 is not None:
         assert quant_type == QuantType.per_1x32
         assert prequantized_a1_scale is not None
@@ -2084,16 +2154,17 @@ def fused_moe_2stages(
                 cols=model_dim,
             )
         else:
-            a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
-                hidden_states,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                topk=topk,
-                block_size=block_size_M,
-                num_rows=num_local_tokens,
-                sorted_weights=sorted_weights,
-            )
+            with _profile_range("aiter_mxfp4_quant_sort"):
+                a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                    hidden_states,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    topk=topk,
+                    block_size=block_size_M,
+                    num_rows=num_local_tokens,
+                    sorted_weights=sorted_weights,
+                )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
@@ -2142,25 +2213,26 @@ def fused_moe_2stages(
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
-    a2 = metadata.stage1(
-        a1,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        None if metadata.fuse_quant else a2,
-        topk,
-        block_m=block_size_M,
-        a1_scale=a1_scale,
-        w1_scale=(
-            w1_scale.view(dtypes.fp8_e8m0)
-            if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
-            else w1_scale
-        ),
-        sorted_weights=sorted_weights if doweight_stage1 else None,
-        **extra_stage1_args,
-    )
+    with _profile_range("aiter_flydsl_stage1"):
+        a2 = metadata.stage1(
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            None if metadata.fuse_quant else a2,
+            topk,
+            block_m=block_size_M,
+            a1_scale=a1_scale,
+            w1_scale=(
+                w1_scale.view(dtypes.fp8_e8m0)
+                if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
+                else w1_scale
+            ),
+            sorted_weights=sorted_weights if doweight_stage1 else None,
+            **extra_stage1_args,
+        )
     if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
@@ -2211,16 +2283,17 @@ def fused_moe_2stages(
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
-        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
-            a2,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            topk=topk,
-            block_size=block_size_M,
-            num_rows=num_local_tokens,
-            sorted_weights=sorted_weights,
-        )
+        with _profile_range("aiter_mxfp4_quant_sort"):
+            a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                a2,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                topk=topk,
+                block_size=block_size_M,
+                num_rows=num_local_tokens,
+                sorted_weights=sorted_weights,
+            )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
@@ -2241,25 +2314,26 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    metadata.stage2(
-        a2,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_out,
-        topk,
-        w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0)
-            if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
-            else w2_scale
-        ),
-        a2_scale=a2_scale,
-        block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
-        **extra_stage2_args,
-    )
+    with _profile_range("aiter_flydsl_stage2"):
+        metadata.stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale=(
+                w2_scale.view(dtypes.fp8_e8m0)
+                if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+                else w2_scale
+            ),
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            sorted_weights=sorted_weights if not doweight_stage1 else None,
+            **extra_stage2_args,
+        )
 
     return moe_out
 
