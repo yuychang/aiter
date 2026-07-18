@@ -37,12 +37,15 @@ from aiter.ops.triton.utils.types import torch_to_triton_dtype
 def _moe_finalize_shared_kernel(
     routed_ptr,  # [P, N]
     scatter_ptr,  # [M, K] int32
+    weight_ptr,  # [M, K] or dummy
     shared_ptr,  # [M, N] or dummy
     out_ptr,  # [M, N]
     stride_rp,
     stride_rn,
     stride_sm,
     stride_sk,
+    stride_wm,
+    stride_wk,
     stride_shm,
     stride_shn,
     stride_om,
@@ -50,12 +53,13 @@ def _moe_finalize_shared_kernel(
     N,
     K: tl.constexpr,
     alpha,
+    HAS_WEIGHTS: tl.constexpr,
     HAS_SHARED: tl.constexpr,
     BLOCK_N: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
 ):
     # One program per (token m, N-block). Gather the K routed slots for token m,
-    # accumulate in fp32, scale, add the shared output, store.
+    # accumulate (optionally weighted) in fp32, scale, add the shared output, store.
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -70,8 +74,13 @@ def _moe_finalize_shared_kernel(
                 routed_ptr + idx * stride_rp + offs_n * stride_rn,
                 mask=mask_n,
                 other=0.0,
-            )
-            acc += row.to(tl.float32)
+            ).to(tl.float32)
+            if HAS_WEIGHTS:
+                w = tl.load(weight_ptr + pid_m * stride_wm + k * stride_wk).to(
+                    tl.float32
+                )
+                row = row * w
+            acc += row
 
     acc = acc * alpha
 
@@ -95,16 +104,21 @@ def moe_finalize_shared(
     scatter_index: torch.Tensor,
     shared_output: Optional[torch.Tensor],
     routed_scaling_factor: float = 1.0,
+    topk_weights: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     block_n: int = 1024,
 ) -> torch.Tensor:
     """Fused routed grouped-combine + routed scaling + shared-expert add.
 
-    out[m] = routed_scaling_factor * sum_k routed_permuted[scatter_index[m, k]]
+    out[m] = routed_scaling_factor
+             * sum_k (topk_weights[m, k] if given else 1) * routed_permuted[scatter_index[m, k]]
              + (shared_output[m] if shared_output is not None else 0)
 
-    Negative `scatter_index` entries are skipped (padding / no-expert slots).
+    Pass ``topk_weights`` when the per-slot routed outputs are *unweighted* (the
+    combine that would apply the routing weight was skipped, e.g. AITER
+    ``no_combine`` output). Pass ``None`` when the slots are already weighted.
+    Negative ``scatter_index`` entries are skipped (padding / no-expert slots).
     """
     assert routed_permuted.ndim == 2, "routed_permuted must be [P, N]"
     assert scatter_index.ndim == 2, "scatter_index must be [M, K]"
@@ -121,17 +135,22 @@ def moe_finalize_shared(
     scatter_index = scatter_index.to(torch.int32)
     has_shared = shared_output is not None
     shared_arg = shared_output if has_shared else out  # dummy strides when unused
+    has_weights = topk_weights is not None
+    weight_arg = topk_weights if has_weights else scatter_index  # dummy when unused
 
     grid = (M, triton.cdiv(N, block_n))
     _moe_finalize_shared_kernel[grid](
         routed_permuted,
         scatter_index,
+        weight_arg,
         shared_arg,
         out,
         routed_permuted.stride(0),
         routed_permuted.stride(1),
         scatter_index.stride(0),
         scatter_index.stride(1),
+        weight_arg.stride(0),
+        weight_arg.stride(1),
         shared_arg.stride(0),
         shared_arg.stride(1),
         out.stride(0),
@@ -139,6 +158,7 @@ def moe_finalize_shared(
         N,
         K=K,
         alpha=float(routed_scaling_factor),
+        HAS_WEIGHTS=has_weights,
         HAS_SHARED=has_shared,
         BLOCK_N=block_n,
         OUT_DTYPE=torch_to_triton_dtype[out_dtype],
@@ -151,6 +171,7 @@ def moe_finalize_shared_ref(
     scatter_index: torch.Tensor,
     shared_output: Optional[torch.Tensor],
     routed_scaling_factor: float = 1.0,
+    topk_weights: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Torch reference for `moe_finalize_shared` (fp32 math, cast back)."""
@@ -163,6 +184,8 @@ def moe_finalize_shared_ref(
     idx = scatter_index.to(torch.long)
     valid = idx >= 0
     gathered = routed_permuted.to(torch.float32)[idx.clamp(min=0)]  # [M, K, N]
+    if topk_weights is not None:
+        gathered = gathered * topk_weights.to(torch.float32)[..., None]
     gathered = gathered * valid.to(torch.float32)[..., None]
     acc = gathered.sum(dim=1) * routed_scaling_factor  # [M, N]
     if shared_output is not None:

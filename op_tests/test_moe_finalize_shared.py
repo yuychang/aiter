@@ -49,20 +49,28 @@ def _build_inputs(m, k, n, e, dtype, drop_frac=0.0):
 
 
 @benchmark()
-def test_moe_finalize_shared(m, k, n, e, dtype, with_shared):
+def test_moe_finalize_shared(m, k, n, e, dtype, with_shared, with_weights):
     routed_permuted, scatter_index, shared_output = _build_inputs(
         m, k, n, e, dtype, drop_frac=0.0
     )
     shared = shared_output if with_shared else None
+    # AITER no_combine returns unweighted slots; pass topk_weights (which for
+    # Kimi already fold in routed_scaling, hence alpha=1 in the real call). Here
+    # we exercise both the weighted and unweighted contracts with alpha=2.5.
+    topk_weights = torch.rand((m, k), dtype=torch.float32) if with_weights else None
     routed_scaling_factor = 2.5
 
     ref = moe_finalize_shared_ref(
-        routed_permuted, scatter_index, shared, routed_scaling_factor
+        routed_permuted, scatter_index, shared, routed_scaling_factor, topk_weights
     )
 
     candidates = {
         "triton": lambda: moe_finalize_shared(
-            routed_permuted, scatter_index, shared, routed_scaling_factor
+            routed_permuted,
+            scatter_index,
+            shared,
+            routed_scaling_factor,
+            topk_weights,
         ),
     }
 
@@ -145,10 +153,12 @@ def main():
 
     for dtype in args.dtype:
         df = []
-        for m, k, n, e, with_shared in itertools.product(
-            args.tokens, args.topk, args.hidden, args.experts, [True, False]
+        for m, k, n, e, with_shared, with_weights in itertools.product(
+            args.tokens, args.topk, args.hidden, args.experts, [True, False], [True, False]
         ):
-            df.append(test_moe_finalize_shared(m, k, n, e, dtype, with_shared))
+            df.append(
+                test_moe_finalize_shared(m, k, n, e, dtype, with_shared, with_weights)
+            )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "moe_finalize_shared summary (markdown):\n%s",
