@@ -24,7 +24,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
                           std::optional<aiter_tensor_t> workspace        = std::nullopt,
                           int dispatch_policy                             = 0,
-                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt);
+                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
+                          std::optional<aiter_tensor_t> m_indices        = std::nullopt,
+                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
 
 // Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4
 // activation quantization and routed-output zeroing for
@@ -448,6 +450,9 @@ struct MoeSortingHostArgs
                             // if return zero, then could be nullptr
                             // must be cleard before use
     void* p_local_topk_ids; // optional [token, topk], global topk ids mapped to local ids
+    // optional fused-a4w4 sort extras (nullptr = not emitted):
+    void* p_m_indices;      // [total_padded] i32: sorted slot -> token id (pad = tokens)
+    void* p_reverse_sorted; // [token*topk]  i32: input (token,slot) -> sorted slot
     opus::index_t tokens;         // if p_local_tokens is not nullptr, this indicate the max possible tokens used for ws/LDS calculation
     opus::index_t unit_size;      // this is the M_a of fused-moe kernel
     opus::index_t num_experts;
@@ -489,6 +494,8 @@ struct MoeSortingKernel
         void* p_total_tokens_post_pad;
         void* p_moe_buf;
         void* p_local_topk_ids;
+        void* p_m_indices;
+        void* p_reverse_sorted;
         opus::index_t tokens;
         opus::index_t num_experts;
         opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
@@ -544,6 +551,8 @@ struct MoeSortingKernel
         k.p_sorted_expert_ids     = h.p_sorted_expert_ids;
         k.p_moe_buf               = h.p_moe_buf;
         k.p_local_topk_ids        = h.p_local_topk_ids;
+        k.p_m_indices             = h.p_m_indices;
+        k.p_reverse_sorted        = h.p_reverse_sorted;
         k.p_total_tokens_post_pad = h.p_total_tokens_post_pad;
         k.tokens                  = h.tokens;
         k.num_experts             = h.num_experts;
@@ -755,6 +764,8 @@ struct MoeSortingKernel
                                                opus::index_t* p_sorted_expert_ids,
                                                opus::index_t* p_total_tokens_post_pad,
                                                IndexType* p_local_topk_ids,
+                                               opus::index_t* p_m_indices,
+                                               opus::index_t* p_reverse_sorted,
                                                const opus::index_t num_experts,
                                                const opus::index_t tokens,
                                                const opus::mdiv unit_size_mdiv,
@@ -1064,6 +1075,12 @@ struct MoeSortingKernel
 #endif
                             p_sorted_weights[position + local_cnt - 1] =
                                 weights[(i_token + i_sub_token) * topk + x - 1];
+                            if(p_m_indices)
+                                p_m_indices[position + local_cnt - 1] =
+                                    (i_token + i_sub_token) & 0x00FFFFFF;
+                            if(p_reverse_sorted)
+                                p_reverse_sorted[(i_token + i_sub_token) * topk + x - 1] =
+                                    position + local_cnt - 1;
                         }
 
                         int remote_cnt = __builtin_amdgcn_ds_bpermute(
@@ -1095,6 +1112,8 @@ struct MoeSortingKernel
                 p_sorted_token_ids[e_start] = tokens;
 #endif
                 p_sorted_weights[e_start] = static_cast<WeightType>(0.0);
+                if(p_m_indices)
+                    p_m_indices[e_start] = tokens; // pad = tokens -> OOB row for gemm1
                 e_start++;
             }
         }
@@ -1134,6 +1153,8 @@ struct MoeSortingKernel
             static_cast<IndexType*>(kargs.p_sorted_expert_ids),
             static_cast<IndexType*>(kargs.p_total_tokens_post_pad),
             static_cast<IndexType*>(kargs.p_local_topk_ids),
+            static_cast<opus::index_t*>(kargs.p_m_indices),
+            static_cast<opus::index_t*>(kargs.p_reverse_sorted),
             kargs.num_experts,
             tokens_,
             kargs.unit_size_mdiv,
@@ -1373,6 +1394,8 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
 #endif
     auto sub_token_          = moe_sorting_get_sub_token(tokens_, num_experts_);
     bool is_sub_token_onshot = tokens_ <= sub_token_;
+    if(num_experts_ >= 512 && is_sub_token_onshot)
+        return false;
     return is_sub_token_onshot;
 }
 
