@@ -797,7 +797,7 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
-    zero_init: bool = True,
+    zero_init: bool = False,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -961,7 +961,7 @@ def flydsl_hgemm(
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
     kernel_family: Optional[str] = None,
-    zero_init: bool = True,
+    zero_init: bool = False,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""

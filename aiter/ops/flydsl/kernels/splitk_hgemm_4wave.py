@@ -110,7 +110,7 @@ def compile_splitk_hgemm_4wave(
     BM: int,
     BK: int = 128,
     dtype: str = "bf16",
-    ZERO_INIT: bool = True,
+    ZERO_INIT: bool = False,
 ):
     assert dtype == "bf16", "cuh port is bf16-only"
     KSLICE = K // SPLITK

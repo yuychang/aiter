@@ -35,7 +35,7 @@ def compile_flydsl_hgemm_kernel(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
-    zero_init: bool = True,
+    zero_init: bool = False,
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 

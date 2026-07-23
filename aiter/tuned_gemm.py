@@ -339,7 +339,7 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
-    zero_init: bool = True,
+    zero_init: bool = False,
     out: Optional[Tensor] = None,
 ) -> Tensor:
     if out is not None:
@@ -361,7 +361,7 @@ def gemm_a16w16(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
-    zero_init: bool = True,
+    zero_init: bool = False,
     out: Optional[Tensor] = None,
 ) -> Tensor:
     bpreshuffle = False
@@ -598,7 +598,7 @@ def flydsl_gemm(
         b_to_lds=flydsl_config["b_to_lds"],
         b_preshuffle=flydsl_config.get("b_preshuffle", False),
         c_to_lds=flydsl_config.get("c_to_lds", False),
-        zero_init=config.get("zero_init", True),
+        zero_init=config.get("zero_init", False),
     )
 
     if bias is not None and fused_bias is None:
@@ -730,7 +730,7 @@ class TunedGemm:
         scale_a: Optional[Tensor] = None,
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
-        zero_init: bool = True,
+        zero_init: bool = False,
         out: Optional[Tensor] = None,
     ):
 

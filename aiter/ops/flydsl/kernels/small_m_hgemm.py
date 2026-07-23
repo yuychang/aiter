@@ -395,7 +395,7 @@ def compile_small_m_hgemm_kernel(
     B_TO_LDS_UNROLL: int = 0,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
-    ZERO_INIT: bool = True,
+    ZERO_INIT: bool = False,
 ):
     if dtype != "bf16":
         raise ValueError(f"`small_m_hgemm.py` only supports bf16, got {dtype!r}")
