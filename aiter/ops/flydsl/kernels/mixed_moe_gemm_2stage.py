@@ -171,8 +171,6 @@ def compile_mixed_moe_gemm1(
             raise ValueError("compact A scales are incompatible with a_scale_one")
         if is_splitk:
             raise ValueError("compact A scales are not supported with split-K")
-        if k_wave != 1:
-            raise ValueError("compact A scales currently require k_wave=1")
         if tile_m != 32 or tile_k != 256 or sort_block_m != 32:
             raise ValueError(
                 "compact A-scale gathering currently requires "

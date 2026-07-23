@@ -237,11 +237,16 @@ def test_fused_sort_quant_is_cuda_graph_replay_safe(experts, topk):
     torch.testing.assert_close(fused[4], torch.zeros_like(fused[4]))
 
 
-def test_flydsl_compact_scale_consumer_matches_conventional_layout():
-    if torch.cuda.get_device_name().find("MI355") < 0:
+@pytest.mark.parametrize("out_dtype", ["bf16", "fp4"])
+@pytest.mark.parametrize("k_wave", [1, 2, 4])
+def test_flydsl_compact_scale_consumer_matches_conventional_layout(k_wave, out_dtype):
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
+    if arch != "gfx950":
         pytest.skip("compact-scale FlyDSL consumer is currently gfx950-only")
 
-    tokens, hidden_size, inter_dim, experts, topk = 8, 256, 128, 16, 4
+    # Use Kimi's production K dimension. In particular, kw4 traverses seven
+    # K tiles per wave and exercises the compact-scale main loop plus odd tail.
+    tokens, hidden_size, inter_dim, experts, topk = 8, HIDDEN, 128, 16, 4
     torch.manual_seed(20260715)
     hidden = (
         torch.randn(
@@ -307,7 +312,7 @@ def test_flydsl_compact_scale_consumer_matches_conventional_layout():
         tile_k=256,
         a_dtype="fp4",
         b_dtype="fp4",
-        out_dtype="bf16",
+        out_dtype=out_dtype,
         act="silu",
         w1_scale=weight_scale,
         sorted_weights=None,
@@ -315,7 +320,7 @@ def test_flydsl_compact_scale_consumer_matches_conventional_layout():
         waves_per_eu=3,
         b_nt=2,
         gate_mode="separated",
-        k_wave=1,
+        k_wave=k_wave,
     )
     reference = flydsl_moe_stage1(
         a1_scale=conventional_scale,
@@ -328,7 +333,42 @@ def test_flydsl_compact_scale_consumer_matches_conventional_layout():
         **kwargs,
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(compact, reference, rtol=0, atol=0)
+
+    def assert_outputs_equal(actual, expected):
+        if out_dtype == "bf16":
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            return
+
+        actual_out, actual_scale = actual
+        expected_out, expected_scale = expected
+        torch.testing.assert_close(
+            actual_out.view(torch.uint8),
+            expected_out.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        num_sorted = int(num_valid_ids[0].item())
+        valid_rows = sorted_ids[:num_sorted].bitwise_and(0x00FFFFFF) != tokens
+        scale_cols = inter_dim // 32
+        padded_scale_cols = (scale_cols + 7) // 8 * 8
+        row = valid_rows.nonzero().flatten().unsqueeze(1)
+        col = torch.arange(scale_cols, device="cuda").unsqueeze(0)
+        scale_positions = (
+            (row >> 5) * (padded_scale_cols * 32)
+            + (col >> 3) * 256
+            + (col & 3) * 64
+            + (row & 15) * 4
+            + ((col >> 2) & 1) * 2
+            + ((row >> 4) & 1)
+        ).flatten()
+        torch.testing.assert_close(
+            actual_scale.view(torch.uint8).flatten()[scale_positions],
+            expected_scale.view(torch.uint8).flatten()[scale_positions],
+            rtol=0,
+            atol=0,
+        )
+
+    assert_outputs_equal(compact, reference)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -340,4 +380,4 @@ def test_flydsl_compact_scale_consumer_matches_conventional_layout():
     graph.replay()
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
+    assert_outputs_equal(replayed, reference)
