@@ -235,7 +235,7 @@ def _is_fused_decode_compact_scale_enabled(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
     return bool(
         parsed is not None
-        and tokens in (8, 16, 32, 64, 128)
+        and tokens in (4, 8, 16, 32, 64, 128)
         and parsed.get("a_dtype") == "fp4"
         and parsed.get("tile_m") == 32
         and parsed.get("tile_k") == 256
