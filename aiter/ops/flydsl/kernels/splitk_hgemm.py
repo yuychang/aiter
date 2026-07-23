@@ -115,7 +115,7 @@ def compile_hgemm_kernel(
     BLOCK_K_WARPS: int = 1,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
-    ZERO_INIT: bool = True,
+    ZERO_INIT: bool = False,
 ):
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
