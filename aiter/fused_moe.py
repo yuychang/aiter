@@ -240,6 +240,10 @@ def _is_fused_decode_compact_scale_enabled(
         and parsed.get("tile_m") == 32
         and parsed.get("tile_k") == 256
         and parsed.get("k_batch", 1) == 1
+        # Multi-K-wave compact addressing is correct and may be forced for
+        # experiments, but it is not a universal win (the Kimi token-32 kw4
+        # row is slower with compact scales). Keep auto mode performance-safe.
+        and (mode != "auto" or parsed.get("k_wave", 1) == 1)
     )
 
 
@@ -1425,11 +1429,12 @@ def _flydsl_stage1_wrapper(
     waves_per_eu = parsed.get("waves_per_eu", 3)
     b_nt = parsed.get("b_nt", 2)
     xcd_swizzle = parsed.get("xcd_swizzle", 0)
-    if a1_scale_compact:
+    if a1_scale_compact and parsed.get("k_wave", 1) == 1:
         tokens = hidden_states.shape[0]
         # Compact-scale variants need a different balance between N-wave
-        # parallelism and scale-gather latency. These overrides are restricted
-        # to the Kimi graph-decode shapes admitted by the caller.
+        # parallelism and scale-gather latency for the original single-K-wave
+        # kernels. Multi-K-wave rows are already explicitly tuned; preserve
+        # their tile/wave parameters while enabling compact scale addressing.
         if tokens == 8:
             waves_per_eu = 2
             b_nt = 2
