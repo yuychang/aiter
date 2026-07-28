@@ -48,6 +48,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
+    KERNEL_FAMILY_HGEMM_4WAVE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
@@ -276,6 +277,23 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
+    # The 4-wave split-K family has no bias slot in its launch signature (see the
+    # hgemm_4wave launcher in aiter/ops/flydsl/gemm_kernels.py, which raises on a
+    # non-None bias). Passing the generic 8-arg list here fails to compile with
+    # "too many positional arguments", so mirror the 7-arg 4wave signature.
+    if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+        _compile_executable_to_cache(
+            exe,
+            _ptr_view_safe(out),
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
+            m,
+            _ptr_view_safe(semaphore),
+            _ptr_view_safe(signal),
+            stream,
+        )
+        return
+
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.
     launch_bias = bias if has_bias else b
