@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fused MXFP4 MoE Sort and Quantization — Feature Analysis</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #596579;
+      --border: #d9e0ea;
+      --accent: #1769aa;
+      --accent-soft: #e9f4ff;
+      --good: #16794b;
+      --good-soft: #e8f7ef;
+      --warn: #9a5a00;
+      --warn-soft: #fff4dc;
+      --risk: #a93636;
+      --risk-soft: #fff0f0;
+      --code: #eef2f7;
+      --shadow: 0 8px 28px rgba(23, 32, 51, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10141c;
+        --panel: #171d27;
+        --text: #edf2f8;
+        --muted: #aab4c3;
+        --border: #303948;
+        --accent: #7cc3ff;
+        --accent-soft: #172c40;
+        --good: #66d39b;
+        --good-soft: #183529;
+        --warn: #ffc56f;
+        --warn-soft: #3b2c17;
+        --risk: #ff9292;
+        --risk-soft: #3d2226;
+        --code: #202836;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 32px)); margin: 0 auto 72px; }
+    header {
+      padding: 60px max(16px, calc((100vw - 1088px) / 2)) 44px;
+      background: linear-gradient(135deg, #102a43, #1769aa);
+      color: #fff;
+    }
+    header p { max-width: 850px; color: #dbeeff; font-size: 1.08rem; }
+    h1 { margin: 0 0 14px; font-size: clamp(2rem, 5vw, 3.3rem); line-height: 1.1; }
+    h2 { margin: 2.6rem 0 1rem; font-size: 1.65rem; scroll-margin-top: 18px; }
+    h3 { margin: 1.7rem 0 0.65rem; font-size: 1.18rem; }
+    p, li { max-width: 92ch; }
+    a { color: var(--accent); }
+    code {
+      padding: 0.12em 0.34em;
+      border-radius: 4px;
+      background: var(--code);
+      font: 0.91em ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    pre {
+      overflow-x: auto;
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--code);
+      line-height: 1.45;
+    }
+    pre code { padding: 0; background: transparent; }
+    nav, section, .card {
+      margin-top: 24px;
+      padding: 24px 28px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    nav ul { columns: 2; margin-bottom: 0; padding-left: 22px; }
+    .summary-grid, .flow-grid, .priority-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+    }
+    .card { margin: 0; padding: 18px; box-shadow: none; }
+    .card strong { display: block; margin-bottom: 5px; color: var(--accent); }
+    .callout {
+      margin: 18px 0;
+      padding: 14px 18px;
+      border-left: 5px solid var(--accent);
+      border-radius: 7px;
+      background: var(--accent-soft);
+    }
+    .callout.good { border-color: var(--good); background: var(--good-soft); }
+    .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+    .callout.risk { border-color: var(--risk); background: var(--risk-soft); }
+    .tag {
+      display: inline-block;
+      margin: 2px 5px 2px 0;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.85rem;
+      font-weight: 650;
+    }
+    .diagram {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 22px 0;
+    }
+    .diagram .node {
+      min-height: 108px;
+      padding: 15px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--code);
+      text-align: center;
+    }
+    .arrow { color: var(--accent); font-size: 1.6rem; font-weight: 800; }
+    table { width: 100%; border-collapse: collapse; margin: 18px 0; }
+    th, td { padding: 10px 12px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--code); }
+    .priority {
+      width: 2.4em;
+      height: 2.4em;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--risk);
+      font-weight: 800;
+    }
+    .small, footer { color: var(--muted); font-size: 0.9rem; }
+    footer { margin-top: 34px; text-align: center; }
+    @media (max-width: 800px) {
+      nav ul { columns: 1; }
+      .summary-grid, .flow-grid, .priority-grid { grid-template-columns: 1fr; }
+      .diagram { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); text-align: center; }
+      section, nav { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Fused MXFP4 MoE Sort and Quantization</h1>
+    <p>
+      A technical explanation and improvement review of the gfx950 decode optimization
+      implemented by commits <code>1ffaf35bb</code> through <code>2432271eb</code>.
+      The report separates verified behavior from recommendations and inferred risks.
+    </p>
+    <span class="tag">gfx950 / CDNA4</span>
+    <span class="tag">MXFP4</span>
+    <span class="tag">Mixture of Experts</span>
+    <span class="tag">Decode M = 1…128</span>
+  </header>
+
+  <main>
+    <nav aria-label="Report contents">
+      <strong>Contents</strong>
+      <ul>
+        <li><a href="#executive-summary">Executive summary</a></li>
+        <li><a href="#problem">Problem and approach</a></li>
+        <li><a href="#data-flow">End-to-end data flow</a></li>
+        <li><a href="#kernel">Fused HIP kernel</a></li>
+        <li><a href="#dispatch">Dispatch and safety gates</a></li>
+        <li><a href="#compact">Compact-scale GEMM consumer</a></li>
+        <li><a href="#tuning">Tuning objective</a></li>
+        <li><a href="#tests">Validation coverage</a></li>
+        <li><a href="#improvements">Improvement roadmap</a></li>
+        <li><a href="#operations">Operational guidance</a></li>
+        <li><a href="#references">Source map</a></li>
+      </ul>
+    </nav>
+
+    <section id="executive-summary">
+      <h2>Executive summary</h2>
+      <div class="summary-grid">
+        <div class="card">
+          <strong>What changed</strong>
+          Route sorting, BF16→MXFP4 activation quantization, and routed-output
+          zeroing now share one 16-CTA HIP launch.
+        </div>
+        <div class="card">
+          <strong>Second optimization</strong>
+          FlyDSL stage-1 GEMM can gather E8M0 scales from compact token-major
+          storage, removing the scale-expansion launch.
+        </div>
+        <div class="card">
+          <strong>Scope</strong>
+          Opt-in, gfx950-only, H=7168, block_m=32, M=1…128, and three
+          expert/top-k routes.
+        </div>
+      </div>
+
+      <div class="callout good">
+        <strong>Core result.</strong> The optimized path reduces preprocessing from
+        separate sort, quantize, and scale-layout conversion launches to one fused
+        launch. The implementation retains the old path as a guarded fallback.
+      </div>
+      <div class="callout warn">
+        <strong>Important qualification.</strong> The “~4 µs scale expansion” and
+        “5–12% stage-1 compact-scale cost on multi-K-wave rows” figures come from
+        the feature commit rationale. They are not reproduced by this report and
+        should be tracked with benchmark artifacts before enabling the feature by default.
+      </div>
+
+      <h3>Assessment</h3>
+      <p>
+        The design is technically coherent: it fuses launch-bound work, reuses
+        sorted IDs already loaded into LDS to address compact scales, adds cache
+        identity for the new compile-time variant, and gates every important kernel
+        assumption. Operator-level and GEMM-consumer correctness coverage is strong.
+        The main remaining weakness is integration confidence: no pytest currently
+        drives the complete public <code>fused_moe(...)</code> dispatch with the
+        environment gates enabled.
+      </p>
+    </section>
+
+    <section id="problem">
+      <h2>Problem and approach</h2>
+      <p>
+        MXFP4 MoE decode works on very small token batches. At that scale, a few
+        microseconds of launch overhead can be a material fraction of layer latency.
+        Before this feature, stage-1 preparation was split across independent GPU
+        operations:
+      </p>
+      <ol>
+        <li>Sort token/top-k routes by expert and pad each expert to 32 rows.</li>
+        <li>Quantize BF16 activations into packed MXFP4 and produce one E8M0 scale per 32 values.</li>
+        <li>Expand token-major scales into sorted-row order for stage-1 GEMM.</li>
+      </ol>
+
+      <div class="diagram" aria-label="Baseline and optimized processing path">
+        <div class="node"><strong>Baseline</strong><br>sort launch<br>+ quant launch<br>+ scale-sort launch</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Phase 1</strong><br>fused sort + quant + zero launch<br>+ scale-sort launch</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Phase 2</strong><br>fused launch<br>+ compact-scale GEMM gather</div>
+      </div>
+
+      <p>
+        The key architectural decision is to leave quantized activations and scales
+        in <em>original-token order</em>. Route sorting produces metadata only.
+        Stage-1 GEMM already gathers activations using packed sorted IDs, so the
+        compact-scale extension derives the same token index and gathers that
+        token’s scale row. This avoids materializing a duplicate scale tensor in
+        sorted-row order.
+      </p>
+    </section>
+
+    <section id="data-flow">
+      <h2>End-to-end data flow</h2>
+      <pre><code>hidden_states [M, 7168] BF16
+topk_ids [M, topk] int32
+topk_weights [M, topk] float32
+        │
+        ▼
+mxfp4_moe_sort_quant_fwd — 16 CTAs × 1024 threads
+        ├── sorted_token_ids [padded routes] int32
+        ├── sorted_weights [padded routes] float32
+        ├── sorted_expert_ids [route blocks] int32
+        ├── num_valid_ids [2] int32
+        ├── moe_buf [M, 7168] zeroed when accumulation requires it
+        ├── activation_quant [M, 3584] packed FP4x2
+        └── activation_scale_token [M, 224] E8M0
+                    │
+                    ▼
+fused_moe_2stages(prequantized_a1=...,
+                  prequantized_a1_scale=...,
+                  prequantized_a1_scale_compact=True)
+                    │
+                    ▼
+FlyDSL GEMM1: sorted ID → original token → compact scale address
+                    │
+                    ▼
+activation + GEMM2 + routed reduction → MoE output</code></pre>
+
+      <h3>Packed sorted ID contract</h3>
+      <p>
+        A valid sorted entry stores <code>(topk_slot &lt;&lt; 24) | token_id</code>.
+        Padded rows use <code>token_id == M</code> as a sentinel. The compact-scale
+        consumer masks the lower 24 bits, checks the token against <code>M</code>,
+        and only then forms <code>token * scale_dwords_per_token + k_offset</code>.
+        The producer and consumer therefore share an implicit binary contract that
+        deserves explicit centralization (see improvement 4).
+      </p>
+    </section>
+
+    <section id="kernel">
+      <h2>Fused HIP kernel</h2>
+      <p>
+        The new public operation is declared in
+        <a href="../aiter/ops/moe_sorting_opus.py"><code>aiter/ops/moe_sorting_opus.py</code></a>
+        and implemented in
+        <a href="../csrc/py_itfs_cu/moe_sorting_opus_kernels.cu"><code>csrc/py_itfs_cu/moe_sorting_opus_kernels.cu</code></a>.
+        It launches 16 CTAs with 1024 threads each. CTA 0 builds route metadata;
+        CTAs 1–15 quantize activations. All CTAs first cooperate in zeroing the
+        routed output buffer.
+      </p>
+
+      <h3>Sorting work in CTA 0</h3>
+      <ol>
+        <li>Build an LDS expert histogram with atomics.</li>
+        <li>Round expert counts to 32-row blocks and perform a DPP prefix scan.</li>
+        <li>Scatter packed token/top-k IDs and route weights into expert regions.</li>
+        <li>Fill padding rows with the token-count sentinel.</li>
+        <li>Write total padded rows and original token count into <code>num_valid_ids</code>.</li>
+        <li>Emit one expert ID per 32-row sorted block.</li>
+      </ol>
+
+      <h3>Quantization work in CTAs 1–15</h3>
+      <p>
+        The model dimension is divided into 224 groups of 32 BF16 values. For each
+        group, a wave computes absolute maximum, encodes an E8M0 scale, and invokes
+        gfx950’s packed scaled FP4 conversion builtin. The output is 16 packed bytes
+        and one scale byte per group. The kernel is intentionally specialized:
+      </p>
+      <table>
+        <thead><tr><th>Constraint</th><th>Supported value</th><th>Reason</th></tr></thead>
+        <tbody>
+          <tr><td>Architecture</td><td>gfx950</td><td>Scaled FP4 conversion instruction availability</td></tr>
+          <tr><td>Model dimension</td><td>7168</td><td>Compile-time work partition and 224 scale columns</td></tr>
+          <tr><td>Sort block</td><td>32</td><td>Metadata padding and stage-1 tiling contract</td></tr>
+          <tr><td>Tokens</td><td>1–128</td><td>Decode specialization and launch geometry</td></tr>
+          <tr><td>Routes</td><td>(256,8), (384,8), (385,9)</td><td>Compile-time expert histogram templates</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout risk">
+        The direct C++ wrapper uses fatal <code>AITER_CHECK</code> validation and the
+        non-gfx950 device path can trap. The Python dispatch gate prevents this in
+        normal <code>fused_moe</code> use, but direct callers of the public operation
+        still face process-level failure for unsupported inputs.
+      </div>
+    </section>
+
+    <section id="dispatch">
+      <h2>Dispatch and safety gates</h2>
+      <p>
+        Dispatch is opt-in through <code>SGLANG_AITER_FUSED_DECODE_SORT_QUANT</code>.
+        Compact scales use <code>SGLANG_AITER_FUSED_DECODE_COMPACT_SCALE</code>, or
+        inherit the first variable when unset. Accepted enabled values are
+        <code>auto</code>, <code>1</code>, <code>true</code>, <code>on</code>, and
+        <code>yes</code>; unset or any other value disables the optimization.
+      </p>
+
+      <h3>Required conditions</h3>
+      <div class="flow-grid">
+        <div class="card"><strong>Hardware and shape</strong>Runtime gfx950; BF16 contiguous [M,7168]; 1≤M≤128; block_m=32.</div>
+        <div class="card"><strong>Routing</strong>Supported expert/top-k pair; contiguous int32 IDs and float32 weights.</div>
+        <div class="card"><strong>Quantization</strong>Per-1×32; FP4 activations and weights; SiLU; G1U1.</div>
+        <div class="card"><strong>Execution family</strong>Two-stage FlyDSL stage 1; not the one-stage path or aux-sort path.</div>
+        <div class="card"><strong>Parallelism</strong>No expert parallel mask/local-token mode; hidden_pad=0; ksplit≤1.</div>
+        <div class="card"><strong>Compact scales</strong>FP4 stage 1 with tile_m=32, tile_k=256, k_batch=1.</div>
+      </div>
+
+      <p>
+        The guard correctly uses live runtime architecture detection rather than a
+        build-target environment setting. Detection failures return to the legacy
+        path. If compact-scale eligibility fails after fused sort/quant succeeds,
+        the wrapper runs the conventional scale-layout conversion; this preserves
+        correctness while retaining part of the launch reduction.
+      </p>
+
+      <h3>API threading</h3>
+      <p>
+        <code>fused_moe_2stages</code> now accepts
+        <code>prequantized_a1</code>, <code>prequantized_a1_scale</code>, and
+        <code>prequantized_a1_scale_compact</code>. Supplying prequantized activation
+        skips the old stage-1 quantization block. Explicit <code>ValueError</code>
+        checks ensure the scale is present and the quantization type is compatible.
+      </p>
+    </section>
+
+    <section id="compact">
+      <h2>Compact-scale FlyDSL GEMM consumer</h2>
+      <p>
+        <a href="../aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py"><code>mixed_moe_gemm_2stage.py</code></a>
+        adds the compile-time <code>a_scale_compact</code> option. It is valid only
+        for FP4 activations, <code>tile_m=32</code>, <code>tile_k=256</code>,
+        <code>sort_block_m=32</code>, and no split-K. Compact variants receive the
+        <code>_asc4</code> module suffix to prevent JIT disk-cache aliasing.
+      </p>
+
+      <h3>Why the load must be deferred</h3>
+      <p>
+        Conventional scales are already in sorted-row order and can be prefetched
+        independently. Compact scales need the original token ID, which stage 1
+        obtains from sorted IDs copied into LDS. The implementation splits A-scale
+        and B-scale prefetch and waits until the sorted-ID LDS write is visible
+        before gathering A scales. This ordering is essential; moving the compact
+        load back into the conventional prefetch phase would create a data dependency
+        violation rather than merely a performance regression.
+      </p>
+
+      <h3>Trade-off</h3>
+      <p>
+        Compact storage saves a conversion launch and avoids the larger sorted-row
+        scale tensor, but makes the GEMM’s A-scale access indirect. The commit notes
+        a 5–12% isolated stage-1 cost for tuner-selected multi-K-wave rows at very
+        small M. The end-to-end decision intentionally favors the saved launch,
+        reported at roughly 4 µs against a 30–65 µs layer. This is a sound
+        layer-level objective, provided those measurements remain stable across
+        driver, compiler, and model revisions.
+      </p>
+    </section>
+
+    <section id="tuning">
+      <h2>Related tuning-objective change</h2>
+      <p>
+        Commit <code>1c87c39f</code> is adjacent to the fused feature and changes the
+        two-stage tuner in
+        <a href="../csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"><code>gemm_moe_tune.py</code></a>.
+        It keeps fused and non-fused stage-1 candidates distinct until launch costs
+        are included, charges non-fused candidates for intermediate quantization
+        consumed by stage 2, and minimizes unrounded stage-1 + stage-2 latency.
+      </p>
+      <p>
+        This matters conceptually: choosing the fastest GEMM1 in isolation can pick
+        a slower layer. The compact-scale feature makes that distinction more
+        visible because its indirect scale gather can lose locally while winning
+        globally by deleting a launch. CPU tests cover candidate deduplication,
+        quantization penalties, pair selection, and rounding ties.
+      </p>
+    </section>
+
+    <section id="tests">
+      <h2>Validation coverage</h2>
+      <p>
+        <a href="../op_tests/test_mxfp4_fused_sort_quant.py"><code>op_tests/test_mxfp4_fused_sort_quant.py</code></a>
+        is gated on a live ROCm gfx950 device and checks:
+      </p>
+      <ul>
+        <li>All three route variants and M={1,2,3,4,8,16,17,32,64,100,127,128}.</li>
+        <li>Canonical route metadata equivalence against existing sorting.</li>
+        <li>Byte-exact FP4 output and E8M0 scale equivalence against existing quantizers.</li>
+        <li>Zeroed routed output.</li>
+        <li>Compact and expanded scale shapes.</li>
+        <li>Dispatch rejection for unsupported shape/route/runtime architecture.</li>
+        <li>CUDA graph capture and repeated replay.</li>
+        <li>Bit-identical stage-1 output for compact vs conventional scales at k_wave 1/2/4 and BF16/FP4 output.</li>
+      </ul>
+
+      <table>
+        <thead><tr><th>Coverage area</th><th>Assessment</th><th>Remaining gap</th></tr></thead>
+        <tbody>
+          <tr><td>Kernel math and metadata</td><td>Strong</td><td>Random/property-based invalid-route stress is absent</td></tr>
+          <tr><td>Kernel contracts</td><td>Strong at normal dispatch gate</td><td>Direct public-op misuse remains fatal</td></tr>
+          <tr><td>Compact GEMM consumer</td><td>Strong</td><td>Only selected K-wave values and one production K dimension</td></tr>
+          <tr><td>CUDA graphs</td><td>Covered</td><td>No full-layer graph test through public dispatch</td></tr>
+          <tr><td>End-to-end dispatch</td><td>Benchmark harness only</td><td>No pytest with env flags and real tuned metadata</td></tr>
+          <tr><td>Performance</td><td>Three benchmark scripts supplied</td><td>No checked-in baseline/threshold artifact</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="improvements">
+      <h2>Where the feature can be improved</h2>
+      <p>
+        Priorities below balance correctness risk, performance confidence, and
+        maintenance cost. “P0” means the most valuable next step, not that a known
+        correctness failure exists.
+      </p>
+
+      <h3><span class="priority">P0</span> Add a full public-dispatch regression test</h3>
+      <p>
+        Exercise <code>fused_moe(...)</code> with both environment variables enabled,
+        real tuned metadata, and supported production routes. Compare the final layer
+        output to the legacy path, verify the compact gate was selected, and repeat
+        inside CUDA graph capture/replay. The current tests prove the two new pieces
+        independently but not their complete wiring, metadata selection, activation,
+        stage 2, and reduction.
+      </p>
+
+      <h3><span class="priority">P0</span> Make public-op failure recoverable</h3>
+      <p>
+        Replace user-input <code>AITER_CHECK</code> process aborts with exceptions
+        surfaced through the PyTorch extension boundary, or expose a checked Python
+        wrapper and clearly mark the raw op internal. A public symbol whose unsupported
+        route can terminate the process is disproportionately risky for serving systems.
+        Device-capability rejection should happen entirely on the host before launch.
+      </p>
+
+      <h3><span class="priority">P1</span> Track end-to-end performance continuously</h3>
+      <p>
+        Store benchmark metadata and thresholds for representative M, route, and
+        <code>k_wave</code> combinations. Report fused kernel time, optional scale-sort
+        time, GEMM1 time, and complete layer time separately. This catches the key
+        failure mode where GEMM1 improves while layer latency regresses—or the reverse.
+        Include ROCm, compiler, clock mode, and GPU SKU in artifacts.
+      </p>
+
+      <h3><span class="priority">P1</span> Generate route support from one source</h3>
+      <p>
+        The C++ macro <code>AITER_MXFP4_SORT_QUANT_ROUTES</code> and Python set
+        <code>_FUSED_DECODE_SORT_QUANT_ROUTES</code> must remain synchronized manually.
+        Generate one side from a shared manifest, export supported tuples from the
+        compiled module, or add a build/test query that compares them. A stale Python
+        superset is fatal; a stale subset silently leaves performance unused.
+      </p>
+
+      <h3><span class="priority">P1</span> Centralize the packed-ID ABI</h3>
+      <p>
+        Token mask <code>0x00ffffff</code>, top-k shift 24, and sentinel semantics
+        appear in producer, consumer, and tests. Define shared constants/helpers and
+        document maximum token/top-k values. This makes future changes to routing
+        metadata auditable and prevents subtle disagreement between HIP and FlyDSL.
+      </p>
+
+      <h3><span class="priority">P2</span> Profile and adapt the quantization CTA split</h3>
+      <p>
+        Fifteen fixed quantization CTAs are likely under-filled at M=1–4, while the
+        sort remains serialized in CTA 0. Profile wave occupancy, execution overlap,
+        and tail efficiency. Candidate experiments include M-dependent CTA counts,
+        combining tiny-M quant work with the sorting CTA after metadata completion,
+        or persistent work distribution. Any change must preserve graph-static launch
+        behavior and avoid increasing synchronization overhead.
+      </p>
+
+      <h3><span class="priority">P2</span> Improve observability and configuration semantics</h3>
+      <p>
+        Add a debug/telemetry reason code for each fallback: unsupported architecture,
+        route, kernel family, split-K, EP, or compact-scale tile. The current one-time
+        warning only covers the aux-sort path. Also consider AITER-scoped environment
+        names with compatibility aliases; <code>SGLANG_AITER_*</code> couples a core
+        library optimization to one integration layer.
+      </p>
+
+      <h3><span class="priority">P2</span> Expand support only from measured demand</h3>
+      <p>
+        Expert parallelism, additional routes, other hidden sizes, and M&gt;128 are
+        unsupported. Generalization should be data-driven because each dimension can
+        alter LDS use, histogram cost, quant work distribution, and tuning. A small
+        code-generated specialization table is preferable to turning all dimensions
+        into runtime values and weakening optimization.
+      </p>
+
+      <h3><span class="priority">P3</span> Reduce API ambiguity</h3>
+      <p>
+        <code>mxfp4_moe_sort_quant_fwd</code> is distinct from the existing
+        <code>mxfp4_moe_sort_quant</code> aux-sort kernel. Rename or namespace the two
+        operations around their output contracts—such as “compact token scales” versus
+        “aux sorted output”—and add shape/dtype details to docstrings.
+      </p>
+    </section>
+
+    <section id="operations">
+      <h2>Operational guidance</h2>
+      <ul>
+        <li>The optimization is off by default. Enabling it never widens kernel support; all gates still apply.</li>
+        <li>Enable sort+quant first and inspect fallback reasons. Compact scales inherit that setting unless explicitly overridden.</li>
+        <li>Do not infer activation from the environment variable alone; confirm selected kernel metadata is FlyDSL FP4 with compatible tiles.</li>
+        <li>Use runtime gfx detection. A build configured for gfx950 does not prove the executing device is gfx950.</li>
+        <li>For unsupported EP, split-K, aux-sort, route, or shape cases, the expected behavior is legacy-path fallback.</li>
+      </ul>
+      <div class="callout">
+        <strong>Recommended rollout criterion.</strong> Enable by default only after
+        public-dispatch correctness tests pass and end-to-end benchmark artifacts show
+        a stable win over supported production shapes across the deployment ROCm/JIT
+        matrix.
+      </div>
+    </section>
+
+    <section id="references">
+      <h2>Source map and commit map</h2>
+      <table>
+        <thead><tr><th>Area</th><th>Primary source</th></tr></thead>
+        <tbody>
+          <tr><td>Python dispatch and prequantized API</td><td><a href="../aiter/fused_moe.py"><code>aiter/fused_moe.py</code></a></td></tr>
+          <tr><td>Python op declaration</td><td><a href="../aiter/ops/moe_sorting_opus.py"><code>aiter/ops/moe_sorting_opus.py</code></a></td></tr>
+          <tr><td>HIP implementation and validation</td><td><a href="../csrc/py_itfs_cu/moe_sorting_opus_kernels.cu"><code>csrc/py_itfs_cu/moe_sorting_opus_kernels.cu</code></a></td></tr>
+          <tr><td>FlyDSL compact-scale consumer</td><td><a href="../aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py"><code>mixed_moe_gemm_2stage.py</code></a></td></tr>
+          <tr><td>FlyDSL stage-1 wrapper</td><td><a href="../aiter/ops/flydsl/moe_kernels.py"><code>aiter/ops/flydsl/moe_kernels.py</code></a></td></tr>
+          <tr><td>GPU regression tests</td><td><a href="../op_tests/test_mxfp4_fused_sort_quant.py"><code>op_tests/test_mxfp4_fused_sort_quant.py</code></a></td></tr>
+          <tr><td>Tuning objective and CPU tests</td><td><a href="../csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"><code>gemm_moe_tune.py</code></a>, <a href="../op_tests/tuning_tests/test_fmoe_tune_objective.py"><code>test_fmoe_tune_objective.py</code></a></td></tr>
+        </tbody>
+      </table>
+      <ol>
+        <li><code>1ffaf35bb</code> — add fused route-sort and activation-quant operator.</li>
+        <li><code>ffb9ae9c5</code> — dispatch eligible decode calls through it.</li>
+        <li><code>28de59feb</code> — add compact-scale FlyDSL GEMM1 support.</li>
+        <li><code>86f512ee4</code> — connect compact producer to compact consumer and retune rows.</li>
+        <li><code>1c87c39f9</code> — make the two-stage tuning objective layer-aware.</li>
+        <li><code>5a36f7452</code> — harden runtime architecture and input guards.</li>
+        <li><code>2432271eb</code> — format the compact-scale kernel changes.</li>
+      </ol>
+      <p class="small">
+        Analysis scope: the feature commit stack above, reviewed from source as of
+        2026-07-30. Performance statements attributed to commit rationale should be
+        treated as reported measurements, not independently reproduced results.
+      </p>
+    </section>
+
+    <footer>Generated as a repository-local engineering review artifact.</footer>
+  </main>
+</body>
+</html>
