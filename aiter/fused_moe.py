@@ -91,6 +91,11 @@ def _get_flydsl_stage1_out(
     shape: tuple[int, int],
     device: torch.device,
 ) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtypes.fp8, device=device)
     stream = torch.cuda.current_stream(device=device).cuda_stream
     key = (device, stream, shape)
     out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
