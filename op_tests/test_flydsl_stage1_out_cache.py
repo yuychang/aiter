@@ -18,7 +18,8 @@ def clear_stage1_out_cache():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_flydsl_stage1_out_is_reused_per_stream():
+def test_flydsl_stage1_out_is_reused_per_stream(monkeypatch):
+    monkeypatch.setenv("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "1")
     device = torch.device("cuda:0")
     shape = (1024, 1536)
 
