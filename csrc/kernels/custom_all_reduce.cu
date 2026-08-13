@@ -502,6 +502,69 @@ void all_gather_unreg(fptr_t _fa,
                 last_dim_size, dim);
 }
 
+void fused_allreduce_partial_rmsnorm(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& out,
+                                     const aiter_tensor_t& w,
+                                     double eps,
+                                     int64_t norm_rows,
+                                     int64_t reg_ptr,
+                                     int64_t reg_bytes,
+                                     bool use_1stage)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    if(inp.dim() != 2 || out.dim() != 2)
+        throw std::runtime_error("partial rmsnorm expects 2D input and output");
+    if(inp.numel() != out.numel() || inp.dtype() != out.dtype())
+        throw std::runtime_error("partial rmsnorm output must match input");
+    int total_rows = (int)inp.size(0);
+    int n          = (int)inp.size(1);
+    if((int)w.numel() != n)
+        throw std::runtime_error("partial rmsnorm weight width must match input");
+    if(norm_rows < 0 || norm_rows > total_rows)
+        throw std::runtime_error("partial rmsnorm norm_rows is out of range");
+
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    void* input_ptr    = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        _copy_input_to_registered_buffer(inp, total_rows, n, stream, reg_ptr, reg_bytes);
+        input_ptr = (void*)reg_ptr;
+    }
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16:
+        fa->dispatchFusedAllReducePartialRMSNorm<opus::fp16_t>(
+            stream,
+            reinterpret_cast<opus::fp16_t*>(input_ptr),
+            reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
+            (float)eps,
+            total_rows,
+            (int)norm_rows,
+            n,
+            use_1stage);
+        break;
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16:
+        fa->dispatchFusedAllReducePartialRMSNorm<opus::bf16_t>(
+            stream,
+            reinterpret_cast<opus::bf16_t*>(input_ptr),
+            reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
+            (float)eps,
+            total_rows,
+            (int)norm_rows,
+            n,
+            use_1stage);
+        break;
+#endif
+    default:
+        throw std::runtime_error("partial rmsnorm supports fp16 and bf16");
+    }
+}
+
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,
