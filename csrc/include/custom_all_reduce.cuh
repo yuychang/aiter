@@ -1527,6 +1527,93 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
     }
 }
 
+// Kimi-K3 packed latent/shared epilogue. The input is viewed as
+// [total_rows, hidden_dim]: rows [0, norm_rows) are the routed latent and are
+// RMS-normalized after the all-reduce; the remaining rows are the shared expert
+// output and must stay as the plain BF16 all-reduce result.
+template <typename T, int tnum, int n_loop>
+__global__ void __launch_bounds__(tnum, 1)
+    local_device_load_partial_rmsnorm(RankSignals sg,
+                                      T* __restrict__ results,
+                                      T* __restrict__ weight,
+                                      float eps,
+                                      int rank,
+                                      int total_rows,
+                                      int norm_rows,
+                                      int n)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    __shared__ float smem[tnum];
+    P* tmps          = get_tmp_buf<P>(sg.signals[rank]);
+    int in_pack_count = n / pack_size;
+
+    for(int bid = blockIdx.x; bid < total_rows; bid += gridDim.x)
+    {
+        if(bid >= norm_rows)
+        {
+#pragma unroll
+            for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+            {
+                int lane = n_iter * tnum + threadIdx.x;
+                if(lane < in_pack_count)
+                {
+                    int idx = bid * in_pack_count + lane;
+                    *(reinterpret_cast<P*>(results) + idx) = tmps[idx];
+                }
+            }
+            continue;
+        }
+
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            int lane = n_iter * tnum + threadIdx.x;
+            if(lane < in_pack_count)
+            {
+                int idx       = bid * in_pack_count + lane;
+                P reduce_pack = tmps[idx];
+                w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + lane);
+                A squares;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float value               = upcast_s(reduce_pack[i]);
+                    rms_inp_f32[n_iter][i]    = value;
+                    squares[i]                = value * value;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(squares);
+            }
+        }
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        float denom = rsqrtf(smem[0] / n + eps);
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            int lane = n_iter * tnum + threadIdx.x;
+            if(lane < in_pack_count)
+            {
+                P normalized;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    normalized[i] = downcast_s<T>(
+                        rms_inp_f32[n_iter][i] * upcast_s(w_arr[n_iter][i]) * denom);
+                }
+                int idx = bid * in_pack_count + lane;
+                *(reinterpret_cast<P*>(results) + idx) = normalized;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template <typename T, int n_loop, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(256, 1)
     local_device_load_rmsnorm_512n(RankSignals sg,
@@ -2059,6 +2146,81 @@ __global__ void __launch_bounds__(1024, 1)
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    allreduce_partial_rmsnorm_kernel_1stage(RankData* _dp,
+                                            RankSignals sg,
+                                            Signal* self_sg,
+                                            int rank,
+                                            T* __restrict__ output,
+                                            T* __restrict__ weight,
+                                            int total_rows,
+                                            int norm_rows,
+                                            int hidden_dim,
+                                            float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int block_size          = hidden_dim / pack_size;
+    bool active             = (int)threadIdx.x < block_size;
+    int access_id_in_row    = threadIdx.x * pack_size;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+        ptrs[i] = (const P*)_dp->ptrs[i];
+
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int row = blockIdx.x; row < total_rows; row += gridDim.x)
+    {
+        A acc{};
+        P reduced{};
+        P weight_p{};
+        int idx = row * block_size + threadIdx.x;
+        if(active)
+        {
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+            {
+                P value = ptrs[r][idx];
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                    acc[v] += upcast_s(value[v]);
+            }
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                // Match the BF16 all-reduce materialization of the split path.
+                reduced[v] = downcast_s<T>(acc[v]);
+                acc[v]     = upcast_s(reduced[v]);
+            }
+        }
+
+        if(row < norm_rows)
+        {
+            if(active)
+                weight_p = *reinterpret_cast<P*>(weight + access_id_in_row);
+            ar_fusion_epilogue<P, A, T, T, pack_size, false>(
+                acc,
+                weight_p,
+                hidden_dim,
+                eps,
+                row * hidden_dim + access_id_in_row,
+                row,
+                (int)blockDim.x,
+                output,
+                nullptr,
+                active,
+                nullptr);
+        }
+        else if(active)
+        {
+            reinterpret_cast<P*>(output)[idx] = reduced;
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
 // scale_out shape: (m, hidden_dim / group_size) instead of (m, 1).
 template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
@@ -2458,6 +2620,30 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     out_hidden_dim,
                                                     eps,
                                                     bf16_output);
+}
+
+template <typename T, int NGPUS>
+void allreduce_partial_rmsnorm_1stage_launcher(RankData* _dp,
+                                               RankSignals sg,
+                                               Signal* self_sg,
+                                               int rank,
+                                               T* output,
+                                               T* weight,
+                                               int total_rows,
+                                               int norm_rows,
+                                               int hidden_dim,
+                                               float eps,
+                                               hipStream_t stream)
+{
+    constexpr int PACK_SIZE = 16 / sizeof(T);
+    constexpr int WARP_SIZE = 32;
+    int block_size          = hidden_dim / PACK_SIZE;
+    int launch_threads      = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    dim3 blocks(std::min(total_rows, kMaxBlocks));
+    dim3 threads(launch_threads);
+    allreduce_partial_rmsnorm_kernel_1stage<T, NGPUS>
+        <<<blocks, threads, 0, stream>>>(
+            _dp, sg, self_sg, rank, output, weight, total_rows, norm_rows, hidden_dim, eps);
 }
 
 template <typename T, int PACK_SIZE>
@@ -4082,6 +4268,115 @@ void dispatchAllGather(
         default: printf("allgather world_size error\n");
         }
     }
+}
+
+template <typename T>
+void dispatchFusedAllReducePartialRMSNorm(hipStream_t stream,
+                                          T* input,
+                                          T* output,
+                                          T* weight,
+                                          float eps,
+                                          int total_rows,
+                                          int norm_rows,
+                                          int n,
+                                          bool use_1stage)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(total_rows <= 0 || norm_rows < 0 || norm_rows > total_rows)
+        throw std::runtime_error("partial rmsnorm requires 0 <= norm_rows <= total_rows");
+    if(n <= 0 || n % pack_size != 0)
+        throw std::runtime_error("partial rmsnorm hidden dimension must be vector aligned");
+
+    int size       = total_rows * n;
+    int n_packs    = n / pack_size;
+    RankData* ptrs = get_buffer_RD(stream, input);
+    use_1stage = use_1stage && n_packs <= 1024;
+
+#define DISPATCH_PARTIAL_1STAGE(NGPUS)                                                   \
+    if(use_1stage)                                                                       \
+    {                                                                                    \
+        allreduce_partial_rmsnorm_1stage_launcher<T, NGPUS>(ptrs,                        \
+                                                             sg_,                         \
+                                                             self_sg_,                    \
+                                                             rank_,                       \
+                                                             output,                      \
+                                                             weight,                      \
+                                                             total_rows,                  \
+                                                             norm_rows,                   \
+                                                             n,                           \
+                                                             eps,                         \
+                                                             stream);                     \
+        return;                                                                          \
+    }
+
+    dim3 block(512);
+    int block_num = ((size / world_size_) + 511) / 512;
+    dim3 grid(std::min(block_num, 80));
+    switch(world_size_)
+    {
+    case 8:
+        DISPATCH_PARTIAL_1STAGE(8);
+        reduce_scatter_cross_device_store<T, 8>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, total_rows, n, n);
+        break;
+    case 4:
+        DISPATCH_PARTIAL_1STAGE(4);
+        reduce_scatter_cross_device_store<T, 4>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, total_rows, n, n);
+        break;
+    case 2:
+        DISPATCH_PARTIAL_1STAGE(2);
+        reduce_scatter_cross_device_store<T, 2>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, total_rows, n, n);
+        break;
+    default:
+        throw std::runtime_error("partial rmsnorm: unsupported world size");
+    }
+#undef DISPATCH_PARTIAL_1STAGE
+
+    hipDevice_t dev;
+    hipDeviceProp_t prop;
+    hipGetDevice(&dev);
+    hipGetDeviceProperties(&prop, dev);
+#define LAUNCH_PARTIAL_RMSNORM(KERNEL)                                             \
+    do                                                                              \
+    {                                                                               \
+        int occupancy = 1;                                                          \
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(                               \
+            &occupancy, reinterpret_cast<const void*>(KERNEL), block.x, 0);          \
+        grid.x = std::min(total_rows, (int)prop.multiProcessorCount * occupancy);    \
+        KERNEL<<<grid, block, 0, stream>>>(                                         \
+            sg_, output, weight, eps, rank_, total_rows, norm_rows, n);              \
+    } while(0)
+
+    if(n_packs >= 256)
+    {
+        int n_loop = (n_packs + 511) / 512;
+        switch(n_loop)
+        {
+        case 1: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 512, 1>)); break;
+        case 2: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 512, 2>)); break;
+        case 3: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 512, 3>)); break;
+        case 4: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 512, 4>)); break;
+        default: throw std::runtime_error("partial rmsnorm hidden dimension too large");
+        }
+    }
+    else if(n_packs >= 64)
+    {
+        block.x = 256;
+        int n_loop = (n_packs + 255) / 256;
+        switch(n_loop)
+        {
+        case 1: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 256, 1>)); break;
+        case 2: LAUNCH_PARTIAL_RMSNORM((local_device_load_partial_rmsnorm<T, 256, 2>)); break;
+        default: throw std::runtime_error("partial rmsnorm hidden dimension unsupported");
+        }
+    }
+    else
+    {
+        throw std::runtime_error("partial rmsnorm hidden dimension too small");
+    }
+#undef LAUNCH_PARTIAL_RMSNORM
 }
 
 template <typename T>
