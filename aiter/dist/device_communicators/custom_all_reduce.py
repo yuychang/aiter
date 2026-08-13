@@ -17,6 +17,7 @@
 
 import os
 import pickle
+import sys
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -397,8 +398,17 @@ class IPCBuffer:
 
     def __del__(self):
         if self._uncached and self._raw_ptr:
-            self._free_fn(self._raw_ptr)
-            self._raw_ptr = 0
+            try:
+                self._free_fn(self._raw_ptr)
+            except (AttributeError, RuntimeError):
+                # torch.ops namespaces may already be torn down during Python
+                # finalization. Raising from __del__ only emits noisy
+                # "Exception ignored" diagnostics; the process is exiting and
+                # the device allocation is reclaimed by the driver.
+                if not getattr(sys, "is_finalizing", lambda: True)():
+                    raise
+            finally:
+                self._raw_ptr = 0
 
 
 class IPCBufferPool:
@@ -1450,6 +1460,67 @@ class CustomAllreduce:
             if emit_bf16:
                 return out, res_out, scale_out, bf16_out
             return out, res_out, scale_out
+
+    def fused_ar_partial_rms(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        norm_rows: int,
+        eps: float,
+        *,
+        out: torch.Tensor | None = None,
+        registered: bool = False,
+        use_1stage: bool = False,
+    ) -> torch.Tensor:
+        """All-reduce every row and RMS-normalize only a leading row prefix."""
+        if out is None:
+            out = torch.empty_like(inp)
+        assert is_weak_contiguous(inp), "input tensor is not weak-contiguous"
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_partial_rmsnorm(
+            self._ptr,
+            inp,
+            out,
+            weight,
+            eps,
+            norm_rows,
+            reg,
+            reg_bytes,
+            use_1stage,
+        )
+        return out
+
+    def custom_fused_ar_partial_rms(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        norm_rows: int,
+        eps: float,
+        use_1stage: bool,
+    ) -> torch.Tensor | None:
+        if self.disabled or not self.should_custom_ar(inp):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_partial_rms(
+                    inp,
+                    weight,
+                    norm_rows,
+                    eps,
+                    registered=True,
+                    use_1stage=use_1stage,
+                )
+            return torch.zeros_like(inp)
+        return self.fused_ar_partial_rms(
+            inp,
+            weight,
+            norm_rows,
+            eps,
+            registered=False,
+            use_1stage=use_1stage,
+        )
 
     def custom_fused_ar_rms(
         self,
