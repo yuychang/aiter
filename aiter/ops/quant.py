@@ -1221,6 +1221,55 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     )
 
 
+def sort_prequantized_mxfp8_for_moe(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort/swizzle scales for an already-quantized MXFP8 MoE input.
+
+    ``input`` remains token-major and is gathered by stage1 through
+    ``sorted_ids``. Only the unswizzled per-token E8M0 scale needs conversion to
+    the sorted GEMM tile layout. This is the second half of
+    :func:`fused_dynamic_mxfp8_quant_moe_sort`, exposed for callers that fused
+    quantization into an earlier routing kernel.
+    """
+    if input.dtype != dtypes.fp8:
+        raise TypeError(f"expected MXFP8 input, got {input.dtype}")
+    if input_scale.dtype != dtypes.fp8_e8m0:
+        raise TypeError(f"expected E8M0 scale, got {input_scale.dtype}")
+    if input.ndim != 2 or input_scale.ndim != 2:
+        raise ValueError("prequantized input and scale must both be 2D")
+    if input.shape[0] != token_num or input_scale.shape[0] != token_num:
+        raise ValueError(
+            f"token mismatch: input={input.shape[0]}, scale={input_scale.shape[0]}, "
+            f"token_num={token_num}"
+        )
+    valid_scale_cols = (input.shape[1] + group_size - 1) // group_size
+    if input_scale.shape[1] != valid_scale_cols:
+        raise ValueError(
+            f"scale columns {input_scale.shape[1]} != expected {valid_scale_cols}"
+        )
+    scale_cols_padded = (valid_scale_cols + 7) // 8 * 8
+    sorted_scale = torch.empty(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, scale_cols_padded),
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    mxfp4_moe_sort_hip(
+        sorted_scale,
+        input_scale.contiguous(),
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        input.shape[1],
+    )
+    return input, sorted_scale
+
+
 @compile_ops("module_quant", develop=True)
 def partial_transpose(
     out: Tensor,
