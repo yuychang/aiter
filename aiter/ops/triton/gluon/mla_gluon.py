@@ -196,7 +196,6 @@ def _mla_gluon(
         shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[512, 16]],
             offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
-            block_bases=[],
             shape=[64, 512]
         )
         blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
@@ -209,7 +208,6 @@ def _mla_gluon(
         shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[512, 16]],
             offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
-            block_bases=[],
             shape=[64, 64]
         )
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -229,7 +227,6 @@ def _mla_gluon(
         shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[512, 16]],
             offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
-            block_bases=[],
             shape=[16, 512]
         )
         blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
@@ -261,7 +258,6 @@ def _mla_gluon(
         shared_kv: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[1024, 32], [8192, 16]],
             offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 16], [0, 1], [0, 2], [0, 8], [0, 4], [0, 32], [0, 64]],
-            block_bases=[],
             shape=[512, 128]
         )
         blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
@@ -274,7 +270,6 @@ def _mla_gluon(
         shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[2048, 16]],
             offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2]],
-            block_bases=[],
             shape=[64, 128]
         )
         blocked_page: gl.constexpr = gl.DistributedLinearLayout(
@@ -304,7 +299,6 @@ def _mla_gluon(
         shared_kv: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[512, 16]],
             offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32]],
-            block_bases=[],
             shape=[512, 64]
         )
         blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
@@ -317,7 +311,6 @@ def _mla_gluon(
         shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
             interval_padding_pairs=[[512, 16]],
             offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
-            block_bases=[],
             shape=[64, 64]
         )
         blocked_page: gl.constexpr = gl.DistributedLinearLayout(
