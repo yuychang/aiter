@@ -609,9 +609,9 @@ def gemm_a8w8_ASM(
         assert dtype in [
             dtypes.bf16,
         ], f"Output {dtype=} is currently not supported in gemm_a8w8_ASM"
-        assert (
-            x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32
-        ), f"{x_scale.dtype=} or {w_scale.dtype=} must be dtypes.fp32"
+        assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
+            f"{x_scale.dtype=} or {w_scale.dtype=} must be dtypes.fp32"
+        )
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -630,9 +630,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert (
-            bias is not None
-        ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        assert bias is not None, (
+            "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        )
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -711,7 +711,7 @@ def gemm_a8w8_bpreshuffle(
     w_k = WQ.shape[-1]
     if w_k < k:
         raise RuntimeError(
-            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, XQ K={k}"
         )
 
     # if (
