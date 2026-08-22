@@ -3114,7 +3114,9 @@ def fused_moe_2stages(
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
         # mxfp8 activations + mxfp4 weights (a8w4) OR mxfp8 weights (a8w8).
-        if _MOE_A8W4_BYPASS_QUANT:
+        if hidden_states.dtype == dtypes.fp8 and a1_scale is not None:
+            a1 = hidden_states
+        elif _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.
             a1 = hidden_states.to(dtypes.fp8)
             M = sorted_ids.shape[0]
