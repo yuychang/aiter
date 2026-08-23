@@ -74,12 +74,18 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# Fuses the K3 route sort with the per-token MXFP8 activation quant into one
+# launch. Nothing here uses streams; it previously defaulted to the value of
+# SGLANG_ROCM_USE_MULTI_STREAM, which coupled an unrelated setting to it and
+# meant a recipe that left multi-stream alone silently lost the fusion. Measured
+# on MI355X at 8k/1k: 3.3% at concurrency 2, 3.1% at 8, 1.6% at 32.
+#
+# Defaults on rather than off so decoupling cannot silently remove the fusion
+# from anyone who had been enabling it through the old variable. The call site
+# additionally requires the exact K3 shape (896 experts, top-16, block_m 32,
+# model_dim 3584), so no other model reaches it.
 _MOE_A8W4_FUSED_SORT_QUANT = (
-    os.environ.get(
-        "AITER_MOE_A8W4_FUSED_SORT_QUANT",
-        os.environ.get("SGLANG_ROCM_USE_MULTI_STREAM", "0"),
-    )
-    == "1"
+    os.environ.get("AITER_MOE_A8W4_FUSED_SORT_QUANT", "1") == "1"
 )
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
