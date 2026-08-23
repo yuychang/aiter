@@ -47,15 +47,6 @@ gfx950,256,4096,1536,7168,torch.float8_e4m3fn,ck,149,0,51.975,a8w8_bpreshuffle_2
 gfx950,256,8192,1536,7168,torch.float8_e4m3fn,flydsl,1640,0,84.9833,flydsl_bpreshuflle_128x192x256_F8_F8_B16_1x1x4x1_default,2122.64,1116.64,0.0
 gfx950,256,16384,1536,7168,torch.float8_e4m3fn,flydsl,667,0,156.303,flydsl_bpreshuflle_128x256x128_F8_F8_B16_1x2x0x2_default,2308.19,1143.82,0.0
 gfx950,256,32768,1536,7168,torch.float8_e4m3fn,ck,33,0,288.0491,a8w8_bpreshuffle_256x256x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3,2504.97,1203.11,0.0
-gfx950,256,1,2112,7168,torch.float8_e4m3fn,flydsl,737,0,11.2132,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x3x0x2_default,2.7,1351.1,0.0
-gfx950,256,2,2112,7168,torch.float8_e4m3fn,flydsl,1059,0,11.2082,flydsl_bpreshuflle_16x64x512_F8_F8_B16_1x4x0x2_default,5.4,1352.72,0.0
-gfx950,256,4,2112,7168,torch.float8_e4m3fn,flydsl,1059,0,11.1888,flydsl_bpreshuflle_16x64x512_F8_F8_B16_1x4x0x2_default,10.82,1357.11,0.0
-gfx950,256,8,2112,7168,torch.float8_e4m3fn,flydsl,1,0,11.4583,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x0x0x2_default,21.14,1329.16,0.0
-gfx950,256,16,2112,7168,torch.float8_e4m3fn,ck,24,0,11.552,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v2,41.94,1326.27,0.0
-gfx950,256,32,2112,7168,torch.float8_e4m3fn,flydsl,1157,0,11.7147,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x0x0x1_default,82.71,1323.41,0.0
-gfx950,256,64,2112,7168,torch.float8_e4m3fn,ck,10,0,10.6857,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1,181.34,1484.97,0.0
-gfx950,256,128,2112,7168,torch.float8_e4m3fn,flydsl,566,0,12.5191,flydsl_bpreshuflle_32x64x512_F8_F8_B16_0x2x4x2_default,309.57,1325.73,0.0
-gfx950,256,256,2112,7168,torch.float8_e4m3fn,flydsl,1476,0,15.9831,flydsl_bpreshuflle_32x64x512_F8_F8_B16_0x1x4x1_default,484.95,1129.64,0.0
 gfx950,256,1,2304,1536,torch.float8_e4m3fn,flydsl,497,0,4.6403,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x2x0x2_default,1.53,763.98,0.0
 gfx950,256,2,2304,1536,torch.float8_e4m3fn,flydsl,1,0,4.681,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x0x0x2_default,3.02,758.65,0.0
 gfx950,256,4,2304,1536,torch.float8_e4m3fn,flydsl,249,0,5.1918,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x1x0x2_default,5.45,686.37,0.0
