@@ -1465,6 +1465,8 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ):
         valid_dim = w.numel()
         if res_out is None:
@@ -1493,6 +1495,8 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    num_norm_rows,
+                    skip_residual,
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -1556,6 +1560,8 @@ class CustomAllreduce:
         gemma_norm: bool = False,
         residual_out: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -1573,6 +1579,8 @@ class CustomAllreduce:
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
+                    num_norm_rows=num_norm_rows,
+                    skip_residual=skip_residual,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -1600,6 +1608,8 @@ class CustomAllreduce:
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
+                num_norm_rows=num_norm_rows,
+                skip_residual=skip_residual,
             )
 
     def custom_fused_ar_rms_packed_input(
