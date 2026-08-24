@@ -4213,6 +4213,62 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         return;                                                                            \
     }
 
+    // Single-kernel 2-stage fused AR+RMSNorm. Each block owns complete tokens
+    // in both stages, so RMSNorm folds into the allgather without a second
+    // launch. Requires hidden == input_hidden == out_n and
+    // (hidden/pack) % world_size == 0. Otherwise fall through to the
+    // two-kernel reduce-scatter + local RMSNorm path.
+    if(!use_1stage && out_n == n && input_hidden_dim == n)
+    {
+        int fused_block_size = n / static_cast<int>(pack_size);
+        if(fused_block_size >= world_size_ && (fused_block_size % world_size_) == 0 &&
+           fused_block_size <= 1024)
+        {
+#define LAUNCH_FUSED_2S(NGPUS, GEMMA)                                                      \
+            allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, GEMMA>(                   \
+                ptrs,                                                                      \
+                sg_,                                                                       \
+                self_sg_,                                                                  \
+                rank_,                                                                     \
+                residual_inp,                                                              \
+                residual_out,                                                              \
+                output,                                                                    \
+                weight,                                                                    \
+                nullptr,                                                                   \
+                size,                                                                      \
+                n,                                                                         \
+                eps,                                                                       \
+                stream,                                                                    \
+                nullptr,                                                                   \
+                num_norm_rows,                                                             \
+                skip_residual)
+            bool launched = false;
+            if(gemma_norm)
+            {
+                switch(world_size_)
+                {
+                case 8: LAUNCH_FUSED_2S(8, true); launched = true; break;
+                case 4: LAUNCH_FUSED_2S(4, true); launched = true; break;
+                case 2: LAUNCH_FUSED_2S(2, true); launched = true; break;
+                default: break;
+                }
+            }
+            else
+            {
+                switch(world_size_)
+                {
+                case 8: LAUNCH_FUSED_2S(8, false); launched = true; break;
+                case 4: LAUNCH_FUSED_2S(4, false); launched = true; break;
+                case 2: LAUNCH_FUSED_2S(2, false); launched = true; break;
+                default: break;
+                }
+            }
+#undef LAUNCH_FUSED_2S
+            if(launched)
+                return;
+        }
+    }
+
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
