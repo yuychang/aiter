@@ -1554,6 +1554,8 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
+        residual_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -1563,6 +1565,8 @@ class CustomAllreduce:
                 return self.fused_ar_rms(
                     input,
                     residual_inp,
+                    res_out=residual_out,
+                    out=out,
                     w=weight,
                     eps=eps,
                     registered=True,
@@ -1588,6 +1592,8 @@ class CustomAllreduce:
             return self.fused_ar_rms(
                 input,
                 residual_inp,
+                res_out=residual_out,
+                out=out,
                 w=weight,
                 eps=eps,
                 registered=False,
