@@ -102,6 +102,30 @@ def _silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
+def _sigmoid_f32(x):
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-LOG2E))))
+    return fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
+
+
+def _tanh_f32(x, x_scaled):
+    two = fx.Float32(2.0)
+    return two * _sigmoid_f32(x_scaled) - fx.Float32(1.0)
+
+
+def _situv2_mul_batch(gs, us, situ_beta, situ_linear_beta):
+    """SiTUv2 epilogue: beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)."""
+    beta = fx.Float32(float(situ_beta))
+    beta_rcp = fx.Float32(1.0 / float(situ_beta))
+    lin_beta = fx.Float32(float(situ_linear_beta))
+    lin_beta_rcp = fx.Float32(1.0 / float(situ_linear_beta))
+    out = []
+    for g, u in zip(gs, us):
+        situ_g = beta * _tanh_f32(g, g * beta_rcp) * _sigmoid_f32(g)
+        up_sc = lin_beta * _tanh_f32(u, u * lin_beta_rcp)
+        out.append(situ_g * up_sc)
+    return out
+
+
 def _pkmax_u16(a_i32, b_i32):
     _v2i16 = T.vec(2, T.i16)
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
@@ -157,6 +181,9 @@ def _gemm1_body(
     N_OUT,
     NE,
     interleave=False,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -701,7 +728,12 @@ def _gemm1_body(
             up_col = fx.Int32(128) + gate_col
             gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
             up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _silu_mul_batch(gate_vs, up_vs)
+        if const_expr(activation == "situv2"):
+            result = _situv2_mul_batch(
+                gate_vs, up_vs, situ_beta, situ_linear_beta
+            )
+        else:
+            result = _silu_mul_batch(gate_vs, up_vs)
 
         local_max = _fabs_f32(result[0])
         for ee in range_constexpr(1, 8):
@@ -785,6 +817,9 @@ def compile_gemm1_a4w4_port(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -816,7 +851,8 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    act_tag = "sv2" if activation == "situv2" else "silu"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}_{act_tag}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 
@@ -901,6 +937,9 @@ def compile_gemm1_a4w4_port(
                 N_OUT=_N_OUT,
                 NE=_NE,
                 interleave=interleave,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
 
     @flyc.jit

@@ -1777,6 +1777,9 @@ def _mxfp4_a4w4_stage1(
     device,
     use_nt=False,
     interleave=False,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1847,6 +1850,9 @@ def _mxfp4_a4w4_stage1(
         topk=topk,
         interleave=interleave,
         xcd_swizzle=_xcd1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -2009,6 +2015,9 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -2053,6 +2062,9 @@ def _mxfp4_a4w4_stage1_fw(
         device=device,
         use_nt=p1["use_nt"],
         interleave=interleave,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -3369,6 +3381,15 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        if activation == ActivationType.Situv2:
+            extra_stage1_args["activation"] = "situv2"
+            extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
+            extra_stage1_args["situ_linear_beta"] = (
+                25.0 if linear_beta is None else float(linear_beta)
+            )
+        else:
+            extra_stage1_args["activation"] = "silu"
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if (
