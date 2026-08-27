@@ -107,23 +107,25 @@ def _sigmoid_f32(x):
     return fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
 
 
-def _tanh_f32(x, x_scaled):
+def _tanh_f32(x, tanh_mul):
+    """tanh(x) via tanh(z)=2*sigmoid(2z)-1 with hoisted ``-2*log2(e)/beta`` multiplier."""
     two = fx.Float32(2.0)
-    return two * _sigmoid_f32(x_scaled) - fx.Float32(1.0)
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(x * tanh_mul)))
+    return two * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e))) - fx.Float32(1.0)
 
 
 def _situv2_mul_batch(gs, us, situ_beta, situ_linear_beta):
     """SiTUv2 epilogue: beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)."""
+    neg_two_log2e = fx.Float32(-2.0 * LOG2E)
     beta = fx.Float32(float(situ_beta))
-    beta_rcp = fx.Float32(1.0 / float(situ_beta))
     lin_beta = fx.Float32(float(situ_linear_beta))
-    lin_beta_rcp = fx.Float32(1.0 / float(situ_linear_beta))
-    out = []
-    for g, u in zip(gs, us):
-        situ_g = beta * _tanh_f32(g, g * beta_rcp) * _sigmoid_f32(g)
-        up_sc = lin_beta * _tanh_f32(u, u * lin_beta_rcp)
-        out.append(situ_g * up_sc)
-    return out
+    gate_tanh_mul = neg_two_log2e * fx.Float32(1.0 / float(situ_beta))
+    up_tanh_mul = neg_two_log2e * fx.Float32(1.0 / float(situ_linear_beta))
+    return [
+        beta * _tanh_f32(gs[i], gate_tanh_mul) * _sigmoid_f32(gs[i])
+        * (lin_beta * _tanh_f32(us[i], up_tanh_mul))
+        for i in range(len(gs))
+    ]
 
 
 def _pkmax_u16(a_i32, b_i32):
