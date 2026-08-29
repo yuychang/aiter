@@ -173,12 +173,22 @@ def kunroll_for(k, BK):
     return k_tiles_total_for(k, BK) - kStages
 
 
+# Number of 32x8 e8m0 scale tiles along the k axis. k/32 is the scale-column
+# count and each shuffled tile covers 8 of them, so this is a ceil, not a floor:
+# the host shuffle (``fp4_utils.moe_mxfp4_sort``, ``e8m0_shuffle``) sizes its
+# buffer with ``cdiv(k/32, 8)`` and zero-pads the tail, and the v2 gemm2 reader
+# in ``mxmoe_gemm_v2.py`` recomputes the same stride as ``cdiv(k, 256) * 64``.
+# Floor agrees with all of them only when k % 256 == 0. At k = 384 (Kimi-K3 TP8's
+# native expert shard) floor gave 1 where every other participant expects 2, so
+# mxfp4_gemm1 wrote the intermediate activation scales at half the stride gemm2
+# read them at -- silently, with no launcher assert, producing cosine errors of
+# 0.27-1.0 and NaN.
 def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return ((k // 32) + 7) // 8
 
 
 def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return ((k // 32) + 7) // 8
 
 
 def kbs_stride_n0_dw_for(k):
