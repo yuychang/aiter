@@ -174,6 +174,7 @@ def _gemm1_body(
     use_nt,
     i32_ntok,
     i32_total_m_blocks,
+    i32_hidden_row_stride_bytes,
     *,
     BM,
     BN,
@@ -260,8 +261,11 @@ def _gemm1_body(
     ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
+    row_stride = i32_hidden_row_stride_bytes
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(
+            (i32_ntok - fx.Int32(1)) * row_stride + fx.Int32(K * 2)
+        )
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         hidden_reg_lay = fx.make_layout(4, 1)
@@ -424,7 +428,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * row_stride
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -875,6 +879,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = gpu.thread_id("x")
@@ -931,6 +936,7 @@ def compile_gemm1_a4w4_port(
                 use_nt,
                 i32_ntok,
                 total_m_blocks,
+                i32_hidden_row_stride_bytes,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -958,6 +964,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -973,6 +980,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            i32_hidden_row_stride_bytes,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm1

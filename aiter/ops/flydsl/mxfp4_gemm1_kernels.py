@@ -132,6 +132,9 @@ def flydsl_mxfp4_gemm1(
         situ_linear_beta,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+    hidden_row_stride_bytes = int(
+        hidden_states.stride(0) * hidden_states.element_size()
+    )
     _moe_kernels._run_compiled(
         launch,
         (
@@ -147,6 +150,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            hidden_row_stride_bytes,
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )
