@@ -972,7 +972,7 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     output: torch.Tensor | None = None,
-        stage2_scatter: Stage2ScatterContext | None = None,
+    stage2_scatter: Stage2ScatterContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
