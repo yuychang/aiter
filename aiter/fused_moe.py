@@ -213,6 +213,7 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -226,11 +227,18 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    # Atomic gemm2 accumulates into moe_buf. Reuse the caller's fused_moe
+    # `output` so stage2 writes the published buffer and fused_moe skips the
+    # trailing D2D copy_ (same contract as opus fused sort+quant). The sort
+    # kernel zeroes this buffer before gemm2, so aliasing is not a residual add.
+    if atomic:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
@@ -404,7 +412,8 @@ def _moe_sorting_impl(
     if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # Thread `output` as moe_buf so atomic gemm2 writes in place (K3 decode
+        # otherwise copies the result once per MoE layer). Sort zeroes moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -415,6 +424,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     # -- Opus / CK standard path --
@@ -2165,8 +2175,14 @@ def _mxfp4_a4w4_stage1_fw(
     D_INTER = w1.shape[1] // 2
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
-    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
-    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+    if inline_quant:
+        # gemm1 quantizes straight into LDS; the global staging buffers are unread,
+        # exactly like a_scale_sorted_shuffled in _mxfp4_a4w4_stage1.
+        a_quant = _empty_u8(device)
+        a_scale = _empty_u8(device)
+    else:
+        a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+        a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
     bf16_zero = (
         moe_buf

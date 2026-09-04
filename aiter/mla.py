@@ -673,11 +673,16 @@ def mla_decode_fwd(
         # passed to stage1) so the asm kernel has a valid destination; whether
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
         # The gfx950 producer conditionally exports a smaller count; it does not
-        # overwrite every entry on every launch. Seed the stage2 upper bound so
-        # an untouched entry means all requested splits are valid.
-        valid_split_count = torch.full(
-            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
-        )
+        # overwrite every entry on every launch. When stage2 reads the buffer
+        # (num_kv_splits > 1), seed the upper bound so an untouched entry means
+        # all requested splits are valid. Stage2 ignores the buffer when there
+        # is a single split, so skip Fill(int) on that path.
+        if num_kv_splits > 1:
+            valid_split_count = torch.full(
+                (bs,), num_kv_splits, dtype=dtypes.i32, device=device
+            )
+        else:
+            valid_split_count = torch.empty((bs,), dtype=dtypes.i32, device=device)
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         aiter.mla_decode_stage1_asm_fwd(
