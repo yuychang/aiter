@@ -2165,14 +2165,8 @@ def _mxfp4_a4w4_stage1_fw(
     D_INTER = w1.shape[1] // 2
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
-    if inline_quant:
-        # gemm1 quantizes straight into LDS; the global staging buffers are unread,
-        # exactly like a_scale_sorted_shuffled in _mxfp4_a4w4_stage1.
-        a_quant = _empty_u8(device)
-        a_scale = _empty_u8(device)
-    else:
-        a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
-        a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
     bf16_zero = (
         moe_buf
