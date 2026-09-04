@@ -213,6 +213,7 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -226,11 +227,17 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    # Atomic gemm2 accumulates into moe_buf. Reuse the caller's fused_moe
+    # `output` so stage2 writes the published buffer and fused_moe skips the
+    # trailing D2D copy_ (same contract as opus fused sort+quant).
+    if atomic:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
@@ -404,7 +411,8 @@ def _moe_sorting_impl(
     if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # Thread `output` as moe_buf so atomic gemm2 writes in place (K3 decode
+        # otherwise copies the result once per MoE layer).
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -415,6 +423,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     # -- Opus / CK standard path --
