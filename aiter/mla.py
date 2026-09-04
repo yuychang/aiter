@@ -674,8 +674,11 @@ def mla_decode_fwd(
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
         # Initialized to num_kv_splits so a min() against it is a no-op until the
         # kernel overwrites it with the real (smaller) valid count.
-        valid_split_count = torch.full(
-            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
+        # Left uninitialized: the asm kernel writes the valid count before
+        # stage2 reads it. Prefilling every decode layer launched Fill(int)
+        # (~4 us) on the CUDA-graph path.
+        valid_split_count = torch.empty(
+            (bs,), dtype=dtypes.i32, device=device
         )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
