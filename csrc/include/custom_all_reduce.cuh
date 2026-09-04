@@ -480,6 +480,106 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Element-parallel 1-stage AR with a fused residual add at the fp32 writeback.
+// Residual is identical on every rank (a fully reduced tensor such as K3's
+// attn-res prefix). Kept as a separate kernel so the default 1-stage launch
+// signature is unchanged.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_res(RankData* _input_dp,
+                                                                        RankData* _output_dp,
+                                                                        RankSignals sg,
+#ifndef USE_ROCM
+                                                                        volatile
+#endif
+                                                                        Signal* self_sg,
+                                                                        T* __restrict__ result,
+                                                                        const T* __restrict__ residual,
+                                                                        int rank,
+                                                                        int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    auto dp     = *_input_dp;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+
+    __shared__ P tmp_smem[2][tnum_gpu * ngpus];
+
+    const int step  = gridDim.x * tnum_gpu;
+    const int start = blockIdx.x * tnum_gpu + lane_id;
+
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    const int first = blockIdx.x * tnum_gpu;
+    int iters       = 0;
+    {
+        int rem = size - first;
+        iters   = rem > 0 ? (rem + step - 1) / step : 0;
+    }
+
+    int buf  = 0;
+    int idx0 = start;
+
+    if(idx0 < size)
+    {
+        P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
+        tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
+    }
+    __syncthreads();
+
+    for(int it = 0; it < iters; ++it)
+    {
+        const int cur_idx  = idx0 + it * step;
+        const int next_idx = cur_idx + step;
+        const int next_buf = buf ^ 1;
+
+        if(warp_id == 0 && cur_idx < size)
+        {
+            P v0 = tmp_smem[buf][0 * tnum_gpu + lane_id];
+
+            A acc;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = upcast_s(v0[j]);
+
+#pragma unroll
+            for(int g = 1; g < ngpus; ++g)
+            {
+                P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    acc[j] += upcast_s(vg[j]);
+            }
+
+            P res = ((const P*)residual)[cur_idx];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(res[j]);
+
+            P out;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                out[j] = downcast_s<T>(acc[j]);
+
+            ((P*)result)[cur_idx] = out;
+        }
+
+        if(next_idx < size)
+        {
+            P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
+            tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
+        }
+
+        __syncthreads();
+
+        buf = next_buf;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
                                                                      RankData* _output_dp,
@@ -3942,6 +4042,89 @@ class CustomAllreduce
 #undef REDUCE_CASE
 #undef KL
 }
+
+    // 1-stage custom AR with a fused residual add. Throws if this size would
+    // take the 2-stage kernel: residual add belongs in that kernel's stage-2
+    // writeback, which this entry point does not specialize.
+    template <typename T>
+    void allreduce_residual(hipStream_t stream,
+                            T* input,
+                            T* output,
+                            const T* residual,
+                            int size,
+                            bool is_broadcast_reg_outptr = false,
+                            int threads                  = 512)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0)
+            throw std::runtime_error(
+                "custom allreduce residual requires input length to be multiple of " +
+                std::to_string(d));
+        if(residual == nullptr)
+            throw std::runtime_error("allreduce_residual requires a residual pointer");
+
+        RankData* input_ptrs  = get_buffer_RD(stream, input);
+        RankData* output_ptrs = nullptr;
+        if(is_broadcast_reg_outptr)
+            output_ptrs = get_output_buffer_RD(stream, output);
+
+        auto bytes = size * sizeof(T);
+        size /= d;
+
+        bool call_1stage = false;
+        if(world_size_ == 2)
+            call_1stage = true;
+        else if(full_nvlink_)
+        {
+            if((world_size_ <= 4 && bytes < 160 * 1024) ||
+               (world_size_ <= 8 && bytes < 80 * 1024))
+                call_1stage = true;
+        }
+        if(!call_1stage)
+            throw std::runtime_error(
+                "allreduce_residual is only implemented for the 1-stage custom AR");
+
+        int blocks = std::min(kMaxBlocks,
+                              (size + (threads / world_size_) - 1) / (threads / world_size_));
+
+#define KL_RES(ngpus)                                                                      \
+    do                                                                                     \
+    {                                                                                      \
+        if(is_broadcast_reg_outptr)                                                        \
+        {                                                                                  \
+            cross_device_reduce_1stage_res<T, ngpus, true><<<blocks, threads, 0, stream>>>( \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size);    \
+        }                                                                                  \
+        else                                                                               \
+        {                                                                                  \
+            cross_device_reduce_1stage_res<T, ngpus, false>                                \
+                <<<blocks, threads, 0, stream>>>(                                          \
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
+        }                                                                                  \
+    } while(0)
+
+        switch(world_size_)
+        {
+        case 2:
+            KL_RES(2);
+            break;
+        case 4:
+            KL_RES(4);
+            break;
+        case 6:
+            KL_RES(6);
+            break;
+        case 8:
+            KL_RES(8);
+            break;
+        default:
+            throw std::runtime_error(
+                "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                "gpus = " +
+                std::to_string(world_size_));
+        }
+#undef KL_RES
+    }
 
 // reduce_scatter dispatch. Python wrapper is responsible for:
 //   - normalizing dim < 0
