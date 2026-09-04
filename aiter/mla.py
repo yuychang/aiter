@@ -672,13 +672,11 @@ def mla_decode_fwd(
         # Per-batch valid KV split count writeback buffer. Always allocated (and
         # passed to stage1) so the asm kernel has a valid destination; whether
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
-        # Initialized to num_kv_splits so a min() against it is a no-op until the
-        # kernel overwrites it with the real (smaller) valid count.
-        # Left uninitialized: the asm kernel writes the valid count before
-        # stage2 reads it. Prefilling every decode layer launched Fill(int)
-        # (~4 us) on the CUDA-graph path.
-        valid_split_count = torch.empty(
-            (bs,), dtype=dtypes.i32, device=device
+        # The gfx950 producer conditionally exports a smaller count; it does not
+        # overwrite every entry on every launch. Seed the stage2 upper bound so
+        # an untouched entry means all requested splits are valid.
+        valid_split_count = torch.full(
+            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
         )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
