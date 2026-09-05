@@ -21,14 +21,26 @@ increments) into this same pre-route kernel.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_buf_tensor,
+    ptr_rsrc,
 )
 
 MAX_G2L_EXPERTS = 512
+
+
+def _lds_load(mr, idx):
+    """Load i32 from an LDS pointer at element offset ``idx``."""
+    return fx.ptr_load(mr + fx.Int64(idx))
+
+
+def _lds_store(mr, val, idx):
+    """Store i32 to an LDS pointer at element offset ``idx``."""
+    fx.ptr_store(val, mr + fx.Int64(idx))
 
 
 def build_moe_g2l_lut_module():
@@ -55,18 +67,25 @@ def build_moe_g2l_lut_module():
         c1 = fx.Int32(1)
         tid = gpu.thread_idx.x
 
-        mask_p = ptr_buf_tensor(mask)
-        lut_p = ptr_buf_tensor(lut)
+        m_rsrc = ptr_rsrc(mask)
+        l_rsrc = ptr_rsrc(lut)
 
-        # num_valid_routes = num_local_tokens * topk (the EP dead-tail bound),
-        # folded in here to drop a standalone torch elementwise launch at decode.
+        # Fold num_valid_routes = num_local_tokens * topk (the EP dead-tail route
+        # bound) into this pre-route single-block kernel: thread 0 reads the (1,)
+        # int32 total_recv scalar and writes nvt*topk to nvr_out. This removes the
+        # standalone torch ``_ep_nvt * topk`` elementwise launch on the decode hot
+        # path; the route / psum-remap / quant kernels consume nvr_out as-is.
         if tid == c0:
-            ptr_buf_tensor(nvr_out)[0] = ptr_buf_tensor(nvt)[0] * topk
+            nvt_val = buffer_ops.buffer_load(
+                ptr_rsrc(nvt), c0, vec_width=1, dtype=T.i32
+            )
+            buffer_ops.buffer_store(nvt_val * topk, ptr_rsrc(nvr_out), c0)
 
-        # Route counter zero-init folded in: E <= n <= block size, so tid<E
-        # clears counter[tid] and the host torch.zeros(E) launch goes away.
+        # Fold the route atomic-counter zero-init into this pre-route kernel:
+        # bucket count E <= n <= block size, so thread tid<E clears counter[tid],
+        # removing the separate host torch.zeros(E) launch before moe_route_g2l.
         if tid < E:
-            ptr_buf_tensor(counter)[tid] = c0
+            buffer_ops.buffer_store(c0, ptr_rsrc(counter), tid)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         mr0 = lds.buf0.ptr
@@ -76,8 +95,8 @@ def build_moe_g2l_lut_module():
 
         # Load 0/1 into LDS.
         if in_range:
-            m = mask_p[tid]
-            mr0[tid] = (m != c0).select(c1, c0)
+            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
+            _lds_store(mr0, (m != c0).select(c1, c0), tid)
 
         gpu.barrier()
 
@@ -87,20 +106,20 @@ def build_moe_g2l_lut_module():
             if const_expr((offset & (offset - 1)) != 0):
                 continue
             if in_range:
-                val = src[tid]
+                val = _lds_load(src, tid)
                 has_prev = tid >= fx.Int32(offset)
                 rd_idx = has_prev.select(tid - fx.Int32(offset), tid)
-                prev = has_prev.select(src[rd_idx], c0)
-                dst[tid] = val + prev
+                prev = has_prev.select(_lds_load(src, rd_idx), c0)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
         # lut[i] = enabled ? incl_prefix[i]-1 : E
         if in_range:
-            incl = src[tid]
-            m2 = mask_p[tid]
+            incl = _lds_load(src, tid)
+            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
             local = incl - c1
-            lut_p[tid] = (m2 != c0).select(local, E)
+            buffer_ops.buffer_store((m2 != c0).select(local, E), l_rsrc, tid)
 
     @flyc.jit
     def launch_g2l(
