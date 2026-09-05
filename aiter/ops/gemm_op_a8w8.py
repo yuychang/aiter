@@ -604,9 +604,9 @@ def gemm_a8w8_ASM(
         assert dtype in [
             dtypes.bf16,
         ], f"Output {dtype=} is currently not supported in gemm_a8w8_ASM"
-        assert (
-            x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32
-        ), f"{x_scale.dtype=} or {w_scale.dtype=} must be dtypes.fp32"
+        assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
+            f"{x_scale.dtype=} or {w_scale.dtype=} must be dtypes.fp32"
+        )
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -625,9 +625,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert (
-            bias is not None
-        ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        assert bias is not None, (
+            "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        )
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -682,8 +682,13 @@ def gemm_a8w8_bpreshuffle_fake(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
-    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+    return (
+        out
+        if out is not None
+        else torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+    )
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
@@ -695,6 +700,7 @@ def gemm_a8w8_bpreshuffle(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         torch.bfloat16,
@@ -706,7 +712,7 @@ def gemm_a8w8_bpreshuffle(
     w_k = WQ.shape[-1]
     if w_k < k:
         raise RuntimeError(
-            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, XQ K={k}"
         )
 
     # if (
@@ -720,7 +726,15 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if out is not None:
+        if out.shape != (m, n) or out.dtype != dtype or out.device != XQ.device:
+            raise ValueError(
+                f"out must be shape {(m, n)}, dtype {dtype}, device {XQ.device}; "
+                f"got shape {tuple(out.shape)}, dtype {out.dtype}, device {out.device}"
+            )
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
