@@ -51,6 +51,14 @@ _LAZY_IMPORTS = {
         ".hstu_attention_kernels",
         "flydsl_hstu_attention_fwd",
     ),
+    "flydsl_kimi_k3_kda_decode": (
+        ".kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode",
+    ),
+    "flydsl_kimi_k3_kda_decode_with_f_b": (
+        ".kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
+    ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
@@ -82,6 +90,10 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "is_flydsl_kimi_k3_kda_decode_supported": (
+        ".kimi_k3_kda_decode",
+        "is_flydsl_kimi_k3_kda_decode_supported",
+    ),
 }
 
 __all__ = [
@@ -94,6 +106,8 @@ __all__ = [
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
     "flydsl_hstu_attention_fwd",
+    "flydsl_kimi_k3_kda_decode",
+    "flydsl_kimi_k3_kda_decode_with_f_b",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
@@ -104,6 +118,7 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "is_flydsl_kimi_k3_kda_decode_supported",
 ]
 
 
