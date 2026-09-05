@@ -690,7 +690,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         return ret
 
     def result_to_df(self, results):
-        resultdf = pd.DataFrame(columns=self.columns)
+        # Concatenating a single-row DataFrame per candidate is quadratic and
+        # dominates large sweeps, so collect records and build the frame once.
+        records = []
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName, libtype = info
@@ -712,22 +714,18 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 )
             key_dict.update(
                 {
-                    "libtype": [libtype],
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "errRatio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
+                    "libtype": libtype,
+                    "kernelId": kernelId,
+                    "splitK": splitK,
+                    "us": time,
+                    "kernelName": kernelName,
+                    "errRatio": err_ratio,
+                    "tflops": tflops,
+                    "bw": bw,
                 }
             )
-            temp = pd.DataFrame(key_dict)
-            if resultdf.empty:
-                resultdf = temp
-            else:
-                resultdf = pd.concat([resultdf, temp], ignore_index=True)
-        return resultdf
+            records.append(key_dict)
+        return pd.DataFrame.from_records(records, columns=self.columns)
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a8w8 import gemm_a8w8_ASM, gemm_a8w8_bpreshuffle

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 import sys
@@ -6068,9 +6069,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return name
 
     @staticmethod
-    def _g2_kname(bm, use_nt, epilog):
-        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle].
-        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
+    def _g2_kname(bm, bk, use_nt, epilog):
+        # flydsl_mxmoe_g2_a4w4_<BM>x256x<BK>[_atomic[_nt] | _f4out | _cshuffle].
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x{bk}"
         if epilog == "atomic":
             name += "_atomic" + ("_nt" if use_nt else "")
         elif epilog == "nonatomic_mxfp4":
@@ -6106,22 +6107,29 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
         g2_bms = {v[0] for v in G2}
+        # Native MXMOE GEMM2 supports BK=128 and BK=256. Include every tile that
+        # exactly divides this shape; coupled tuning decides the winner.
+        g2_bks = [bk for bk in (128, 256) if int(row["inter_dim"]) % bk == 0]
+        native_g2_only = os.environ.get("AITER_MXFP4_TUNE_NATIVE_G2_ONLY", "0") == "1"
         cands = []
         for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
                 if bm in g2_bms:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
+                    for bk in g2_bks:
+                        for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                            cands.append(
+                                self._candidate_row(
+                                    row, bm, kn1, self._g2_kname(bm, bk, n2, ep)
+                                )
                             )
-                        )
                 # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
                 # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
                 # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
                 # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
+                if native_g2_only:
+                    continue
                 for kn2v, kp in get_flydsl_stage2_v2_kernels(
                     "fp4",
                     "fp4",
@@ -6170,7 +6178,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _activation_from_row(row):
+        act = str(row["act_type"])
+        if act.endswith("Situv2"):
+            return ActivationType.Situv2
+        if act.endswith("Swiglu"):
+            return ActivationType.Swiglu
+        return ActivationType.Silu
+
+    @staticmethod
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, activation, situ_beta, situ_linear_beta):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
@@ -6202,6 +6219,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            activation="situv2" if activation == ActivationType.Situv2 else "silu",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6249,26 +6269,33 @@ class Mxfp4FlydslTuner(FmoeTuner):
             doweight_stage1=False,
         )
 
-    def _run_candidate(self, row, candidate, args):
+    def _run_candidate(self, row, candidate, args, data=None, ref=None):
         from aiter.test_common import run_perftest
 
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
+        activation = self._activation_from_row(row)
+        situ_beta = 4.0
+        situ_linear_beta = 25.0
+        if data is None:
+            data = self._prepare_case(token, h, e, ne, topk, dtype)
+        out = self._port_e2e(
+            data, kn1, kn2, topk, ne, h, dtype, activation, situ_beta, situ_linear_beta
         )
-        data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
-        ref = self._torch_ref(data, topk, dtype, activation)
+        if ref is None:
+            ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-        if err is None or float(err) > args.errRatio:
+        # A candidate that produced NaN/Inf output gets a NaN cosine error, and
+        # `nan > errRatio` is False, so reject non-finite before thresholding.
+        err = None if err is None else float(err)
+        if err is None or not math.isfinite(err) or err > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, activation, situ_beta, situ_linear_beta
+            ),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
@@ -6308,12 +6335,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        dtype = dtypes.bf16
+        activation = self._activation_from_row(row)
+        data = self._prepare_case(token, h, e, ne, topk, dtype)
+        ref = self._torch_ref(data, topk, dtype, activation)
+
         best, failures = None, []
         for candidate in self._candidate_rows(row):
             if timeout > 0:
                 signal.alarm(timeout)
             try:
-                us = self._run_candidate(row, candidate, args)
+                us = self._run_candidate(row, candidate, args, data=data, ref=ref)
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
                     f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
