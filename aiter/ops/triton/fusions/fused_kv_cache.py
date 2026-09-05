@@ -216,8 +216,8 @@ def fused_qk_rope_cat_and_cache_mla(
     else:
         b_q_out, qh_q_out, d_q_out = q_out.shape
         assert (
-            b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out
-        ), "q_out shape mismatch"
+            b == b_q_out and qh_q_out >= qh and d_nope + d_pe == d_q_out
+        ), "q_out must match batch/dim and have at least the input Q heads"
 
     if decode_q_pe_out is None:
         decode_q_pe_out = torch.empty(
