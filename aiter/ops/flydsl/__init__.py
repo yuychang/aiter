@@ -43,6 +43,14 @@ _LAZY_IMPORTS = {
         "flydsl_fp8_mqa_logits",
     ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
+    "flydsl_kimi_k3_kda_decode": (
+        ".kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode",
+    ),
+    "flydsl_kimi_k3_kda_decode_with_f_b": (
+        ".kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
+    ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
@@ -66,6 +74,10 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "is_flydsl_kimi_k3_kda_decode_supported": (
+        ".kimi_k3_kda_decode",
+        "is_flydsl_kimi_k3_kda_decode_supported",
+    ),
 }
 
 __all__ = [
@@ -76,6 +88,8 @@ __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
+    "flydsl_kimi_k3_kda_decode",
+    "flydsl_kimi_k3_kda_decode_with_f_b",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
@@ -84,6 +98,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "is_flydsl_kimi_k3_kda_decode_supported",
 ]
 
 
