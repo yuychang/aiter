@@ -315,6 +315,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     kv_cache_stride_h,
     kv_cache_stride_d,
     k_scale_ptr,
+    q_scale_ptr,
     QH_PER_KH: tl.constexpr,
     QH: tl.constexpr,
     KH: tl.constexpr,
@@ -329,6 +330,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
+    HAVE_Q_SCALE: tl.constexpr = False,
     UPCAST_OPERAND: tl.constexpr = False,
     SANITIZE_INVALID_Q_POS: tl.constexpr = False,
     IDENTITY_ROPE: tl.constexpr = False,
@@ -396,6 +398,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             BLOCK_D_pe,
             BLOCK_D_HALF_pe,
         )
+        if HAVE_Q_SCALE:
+            q_scale_rcprl = (1.0 / tl.load(q_scale_ptr)).to(tl.float32)
+            q_nope = q_nope.to(tl.float32) * q_scale_rcprl
+            q_pe = q_pe.to(tl.float32) * q_scale_rcprl
         tl.store(
             q_out_ptrs + d_nope_offs * q_out_stride_d,
             q_nope.to(q_out_ptr.dtype.element_ty),

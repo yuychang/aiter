@@ -275,6 +275,7 @@ def test_fused_qk_rope_cat_and_cache_mla_sanitizes_invalid_q_positions():
     cos = torch.ones(1, d_pe // 2, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    q_scale = torch.full((1,), 1.0 / 16.0, device="cuda", dtype=torch.float32)
 
     q_out, _, _, _ = fused_qk_rope_cat_and_cache_mla(
         q_nope,
@@ -288,13 +289,14 @@ def test_fused_qk_rope_cat_and_cache_mla_sanitizes_invalid_q_positions():
         sin,
         scale,
         True,
+        q_scale=q_scale,
         q_out_dtype=e4m3_dtype,
         compute_all_q_rope=False,
         identity_rope=True,
     )
     torch.cuda.synchronize()
 
-    expected_q = torch.cat((q_nope, q_pe), dim=-1).to(e4m3_dtype)
+    expected_q = (torch.cat((q_nope, q_pe), dim=-1) / q_scale).to(e4m3_dtype)
     expected_k = torch.cat((k_nope[:2], k_pe[:2]), dim=-1).to(e4m3_dtype)
     torch.testing.assert_close(q_out, expected_q)
     torch.testing.assert_close(kv_cache[:2], expected_k)
