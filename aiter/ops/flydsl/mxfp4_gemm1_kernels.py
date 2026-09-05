@@ -30,6 +30,9 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -45,6 +48,9 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -92,6 +98,9 @@ def flydsl_mxfp4_gemm1(
     interleave=False,
     xcd_swizzle=0,
     stream=None,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     _assert_supported(
         NE=NE,
@@ -118,8 +127,14 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        activation,
+        situ_beta,
+        situ_linear_beta,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+    hidden_row_stride_bytes = int(
+        hidden_states.stride(0) * hidden_states.element_size()
+    )
     _moe_kernels._run_compiled(
         launch,
         (
@@ -135,6 +150,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            hidden_row_stride_bytes,
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )
