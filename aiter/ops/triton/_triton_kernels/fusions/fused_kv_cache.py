@@ -331,6 +331,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: tl.constexpr = False,
     UPCAST_OPERAND: tl.constexpr = False,
     SANITIZE_INVALID_Q_POS: tl.constexpr = False,
+    IDENTITY_ROPE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -357,13 +358,17 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         else:
             d_cos_offs = d_pe_offs
 
-        pos = tl.load(pos_ptr + pid_b * pos_stride_b)
-        if SANITIZE_INVALID_Q_POS:
-            q_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
-            pos = tl.where(q_slot >= 0, pos, 0)
-        cos_offs = pos * cos_stride_b + d_cos_offs * cos_stride_d
-        cos = tl.load(cos_ptr + cos_offs)
-        sin = tl.load(sin_ptr + cos_offs)
+        if IDENTITY_ROPE:
+            cos = 1.0
+            sin = 0.0
+        else:
+            pos = tl.load(pos_ptr + pid_b * pos_stride_b)
+            if SANITIZE_INVALID_Q_POS:
+                q_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
+                pos = tl.where(q_slot >= 0, pos, 0)
+            cos_offs = pos * cos_stride_b + d_cos_offs * cos_stride_d
+            cos = tl.load(cos_ptr + cos_offs)
+            sin = tl.load(sin_ptr + cos_offs)
         if UPCAST_OPERAND:
             cos = cos.to(tl.float32)
             sin = sin.to(tl.float32)

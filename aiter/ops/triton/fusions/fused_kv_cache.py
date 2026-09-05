@@ -60,6 +60,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     compute_all_q_rope: bool = True,
+    identity_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -120,6 +121,7 @@ def fused_qk_rope_cat_and_cache_mla(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     compute_all_q_rope: bool = True,
+    identity_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -323,6 +325,7 @@ def fused_qk_rope_cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         SANITIZE_INVALID_Q_POS=not compute_all_q_rope,
+        IDENTITY_ROPE=identity_rope,
         num_warps=1,
     )
 

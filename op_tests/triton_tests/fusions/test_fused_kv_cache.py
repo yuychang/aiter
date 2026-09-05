@@ -271,10 +271,8 @@ def test_fused_qk_rope_cat_and_cache_mla_sanitizes_invalid_q_positions():
         tokens, 1, d_nope + d_pe, device="cuda", dtype=e4m3_dtype
     )
     slots = torch.tensor([0, 1, -1, -1], device="cuda", dtype=torch.int64)
-    positions = torch.tensor(
-        [0, 1, 2**40, 2**40], device="cuda", dtype=torch.int64
-    )
-    cos = torch.ones(2, d_pe // 2, device="cuda", dtype=torch.bfloat16)
+    positions = torch.full((tokens,), 2**40, device="cuda", dtype=torch.int64)
+    cos = torch.ones(1, d_pe // 2, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
 
@@ -292,6 +290,7 @@ def test_fused_qk_rope_cat_and_cache_mla_sanitizes_invalid_q_positions():
         True,
         q_out_dtype=e4m3_dtype,
         compute_all_q_rope=False,
+        identity_rope=True,
     )
     torch.cuda.synchronize()
 
