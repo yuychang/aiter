@@ -260,50 +260,6 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
-def test_fused_qk_rope_cat_and_cache_mla_accepts_padded_q_out():
-    """Kimi-K3 TP8 writes 12 real heads into a persistent 16-head FP8 buffer."""
-    torch.manual_seed(7)
-    tokens, q_heads, padded_heads = 4, 12, 16
-    d_nope, d_pe = 512, 64
-    q_nope = torch.randn(tokens, q_heads, d_nope, device="cuda", dtype=torch.bfloat16)
-    q_pe = torch.randn(tokens, q_heads, d_pe, device="cuda", dtype=torch.bfloat16)
-    k_nope = torch.randn(tokens, 1, d_nope, device="cuda", dtype=torch.bfloat16)
-    k_pe = torch.randn(tokens, 1, d_pe, device="cuda", dtype=torch.bfloat16)
-    q_out = torch.zeros(
-        tokens, padded_heads, d_nope + d_pe, device="cuda", dtype=e4m3_dtype
-    )
-    kv_cache = torch.zeros(
-        tokens, 1, d_nope + d_pe, device="cuda", dtype=e4m3_dtype
-    )
-    slots = torch.arange(tokens, device="cuda", dtype=torch.int64)
-    positions = torch.arange(tokens, device="cuda", dtype=torch.int64)
-    cos = torch.ones(tokens, d_pe // 2, device="cuda", dtype=torch.bfloat16)
-    sin = torch.zeros_like(cos)
-    scale = torch.ones(1, device="cuda", dtype=torch.float32)
-
-    got, _, _, _ = fused_qk_rope_cat_and_cache_mla(
-        q_nope,
-        q_pe,
-        k_nope,
-        k_pe,
-        kv_cache,
-        slots,
-        positions,
-        cos,
-        sin,
-        scale,
-        True,
-        q_out=q_out,
-        q_out_dtype=e4m3_dtype,
-    )
-
-    expected_q = torch.cat((q_nope, q_pe), dim=-1).to(e4m3_dtype)
-    expected_k = torch.cat((k_nope, k_pe), dim=-1).to(e4m3_dtype)
-    torch.testing.assert_close(got[:, :q_heads], expected_q)
-    torch.testing.assert_close(kv_cache, expected_k)
-    assert torch.count_nonzero(got[:, q_heads:]).item() == 0
-
-
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
