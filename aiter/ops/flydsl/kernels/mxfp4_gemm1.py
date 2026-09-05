@@ -102,6 +102,32 @@ def _silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
+def _sigmoid_f32(x):
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-LOG2E))))
+    return fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
+
+
+def _tanh_f32(x, tanh_mul):
+    """tanh(x) via tanh(z)=2*sigmoid(2z)-1 with hoisted ``-2*log2(e)/beta`` multiplier."""
+    two = fx.Float32(2.0)
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(x * tanh_mul)))
+    return two * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e))) - fx.Float32(1.0)
+
+
+def _situv2_mul_batch(gs, us, situ_beta, situ_linear_beta):
+    """SiTUv2 epilogue: beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)."""
+    neg_two_log2e = fx.Float32(-2.0 * LOG2E)
+    beta = fx.Float32(float(situ_beta))
+    lin_beta = fx.Float32(float(situ_linear_beta))
+    gate_tanh_mul = neg_two_log2e * fx.Float32(1.0 / float(situ_beta))
+    up_tanh_mul = neg_two_log2e * fx.Float32(1.0 / float(situ_linear_beta))
+    return [
+        beta * _tanh_f32(gs[i], gate_tanh_mul) * _sigmoid_f32(gs[i])
+        * (lin_beta * _tanh_f32(us[i], up_tanh_mul))
+        for i in range(len(gs))
+    ]
+
+
 def _pkmax_u16(a_i32, b_i32):
     _v2i16 = T.vec(2, T.i16)
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
@@ -148,6 +174,7 @@ def _gemm1_body(
     use_nt,
     i32_ntok,
     i32_total_m_blocks,
+    i32_hidden_row_stride_bytes,
     *,
     BM,
     BN,
@@ -157,6 +184,9 @@ def _gemm1_body(
     N_OUT,
     NE,
     interleave=False,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -231,8 +261,11 @@ def _gemm1_body(
     ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
+    row_stride = i32_hidden_row_stride_bytes
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(
+            (i32_ntok - fx.Int32(1)) * row_stride + fx.Int32(K * 2)
+        )
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         hidden_reg_lay = fx.make_layout(4, 1)
@@ -395,7 +428,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * row_stride
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -701,7 +734,12 @@ def _gemm1_body(
             up_col = fx.Int32(128) + gate_col
             gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
             up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _silu_mul_batch(gate_vs, up_vs)
+        if const_expr(activation == "situv2"):
+            result = _situv2_mul_batch(
+                gate_vs, up_vs, situ_beta, situ_linear_beta
+            )
+        else:
+            result = _silu_mul_batch(gate_vs, up_vs)
 
         local_max = _fabs_f32(result[0])
         for ee in range_constexpr(1, 8):
@@ -785,6 +823,9 @@ def compile_gemm1_a4w4_port(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    activation="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -816,7 +857,8 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    act_tag = "sv2" if activation == "situv2" else "silu"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}_{act_tag}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 
@@ -837,6 +879,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = gpu.thread_id("x")
@@ -893,6 +936,7 @@ def compile_gemm1_a4w4_port(
                 use_nt,
                 i32_ntok,
                 total_m_blocks,
+                i32_hidden_row_stride_bytes,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -901,6 +945,9 @@ def compile_gemm1_a4w4_port(
                 N_OUT=_N_OUT,
                 NE=_NE,
                 interleave=interleave,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
 
     @flyc.jit
@@ -917,6 +964,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -932,6 +980,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            i32_hidden_row_stride_bytes,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm1

@@ -173,12 +173,17 @@ def kunroll_for(k, BK):
     return k_tiles_total_for(k, BK) - kStages
 
 
+# Number of 32x8 e8m0 scale tiles along the k axis. Must be a ceil to match the
+# host shuffle (``fp4_utils.e8m0_shuffle``, which sizes with ``cdiv(k/32, 8)``
+# and zero-pads the tail) and the v2 gemm2 reader in ``mxmoe_gemm_v2.py``
+# (``cdiv(k, 256) * 64``). A floor agrees only when k % 256 == 0, and nothing
+# asserts the stride, so a mismatch corrupts scales silently.
 def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return ((k // 32) + 7) // 8
 
 
 def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return ((k // 32) + 7) // 8
 
 
 def kbs_stride_n0_dw_for(k):

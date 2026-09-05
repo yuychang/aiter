@@ -4,7 +4,7 @@
 # Pure mxmoe kernel-name parsing (no torch / JIT deps) so the AOT pre-compile
 # pass can import it without triggering JIT module loads.
 #
-# Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase. Shape is in
+# Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x<BN>x<BK>[_flag...], lowercase. Shape is in
 # the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
 # cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
 
@@ -37,6 +37,8 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         mt = _MXMOE_TILE_RE.match(tok)
         if mt:
             nums["BM"] = int(mt.group(1))
+            nums["BN"] = int(mt.group(2))
+            nums["BK"] = int(mt.group(3))
             continue
         utok = tok.upper()
         if utok in flag_tokens:
@@ -55,6 +57,8 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
     nums, flags = parsed["nums"], parsed["flags"]
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
@@ -77,6 +81,8 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         )
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "atomic": atomic,
@@ -133,6 +139,8 @@ def parse_g2_kname_any(kname) -> dict:
     return {
         "v2": False,
         "BM": p2["BM"],
+        "BN": p2["BN"],
+        "BK": p2["BK"],
         "atomic": p2["atomic"],
         "use_nt": p2["use_nt"],
         "mxfp4out": p2["mxfp4out"],
