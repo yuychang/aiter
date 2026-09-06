@@ -81,6 +81,33 @@ _MOE_A8W4_FUSED_SORT_QUANT = (
 # so there is no overhead.
 kernel_bench_callable = None
 
+# Optional BM=16 sort metadata produced by SGLang's fused radix4+sort kernel.
+# Registered on the same thread immediately before fused_moe; CUDA-graph replay
+# does not re-enter Python, so the skip is baked into the captured launches.
+_K3_PRESORTED_MOE = None
+
+
+def register_k3_presorted_moe(aux: dict | None) -> None:
+    global _K3_PRESORTED_MOE
+    _K3_PRESORTED_MOE = aux
+
+
+def _take_k3_presorted_moe(topk_ids, *, block_m, num_experts, topk):
+    global _K3_PRESORTED_MOE
+    aux = _K3_PRESORTED_MOE
+    _K3_PRESORTED_MOE = None
+    if not aux:
+        return None
+    if (
+        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
+        or int(aux.get("block_m", -1)) != int(block_m)
+        or int(aux.get("num_experts", -1)) != int(num_experts)
+        or int(aux.get("topk", -1)) != int(topk)
+    ):
+        return None
+    return aux
+
 # Stage1's intermediate is consumed immediately by stage2, so it can be shared
 # across layers. Keyed by stream so overlapping launches stay correct, and by
 # exact shape so graph-baked pointers stay stable.
@@ -1265,25 +1292,55 @@ def _fused_moe_impl(
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = moe_sorting(
+        _presorted = _take_k3_presorted_moe(
             topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            accumulate=_atomic,
-            output_aux=True,
-            output=output,
+            block_m=block_size_M,
+            num_experts=global_E,
+            topk=topk,
         )
+        if _presorted is not None:
+            sorted_ids = _presorted["sorted_token_ids"]
+            sorted_weights = _presorted["sorted_weights"]
+            sorted_expert_ids = _presorted["sorted_expert_ids"]
+            num_valid_ids = _presorted["num_valid_ids"]
+            sort_m_indices = _presorted["m_indices"]
+            sort_reverse_sorted = _presorted["reverse_sorted"]
+            if _atomic:
+                moe_buf = (
+                    output
+                    if output is not None
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                zeroed_ptr = int(_presorted.get("moe_buf_ptr", 0))
+                if not (
+                    _presorted.get("moe_buf_zeroed")
+                    and zeroed_ptr == int(moe_buf.data_ptr())
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+        else:
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                accumulate=_atomic,
+                output_aux=True,
+                output=output,
+            )
         local_topk_ids = None
     else:
         sorting_ret = moe_sorting(
