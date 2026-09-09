@@ -69,6 +69,12 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# Fuse the K3 route sort with the per-token MXFP8 activation quant into one
+# launch. The call site also requires the exact K3 shape (896 experts, top-16,
+# block_m 32, model_dim 3584), so no other model reaches it.
+_MOE_A8W4_FUSED_SORT_QUANT = (
+    os.environ.get("AITER_MOE_A8W4_FUSED_SORT_QUANT", "1") == "1"
+)
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -121,6 +127,7 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -134,11 +141,17 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    # Atomic gemm2 accumulates into moe_buf, so handing it the caller's buffer
+    # saves the trailing copy. The sort kernel zeroes moe_buf before gemm2, so
+    # this is not a residual add.
+    if atomic:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
@@ -178,13 +191,90 @@ def _adaptive_moe_sort(
     return std
 
 
+def _k3_a8w4_fused_sort_quant(
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    *,
+    output,
+    num_experts,
+    topk,
+    block_m,
+    model_dim,
+    dtype,
+):
+    """K3 route sort + per-token MXFP8 quant in one HIP launch."""
+    M = hidden_states.shape[0]
+    active = min(num_experts, M * topk)
+    max_sorted = (
+        ((M * topk + active * (block_m - 1)) + block_m - 1) // block_m
+    ) * block_m
+    device = hidden_states.device
+    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.empty(
+        max_sorted // block_m, dtype=dtypes.i32, device=device
+    )
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    a_quant = torch.empty((M, model_dim), dtype=dtypes.fp8, device=device)
+    a_scale = torch.empty((M, model_dim // 32), dtype=torch.uint8, device=device)
+    moe_buf = (
+        output
+        if output is not None
+        else torch.empty((M, model_dim), dtype=dtype, device=device)
+    )
+    aiter.mxfp4_moe_sort_quant(
+        a_input=hidden_states,
+        topk_ids=topk_ids,
+        topk_weight=topk_weights,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        reverse_sorted=reverse_sorted,
+        sorted_weights=sorted_weights,
+        a_quant=a_quant,
+        a_scale=a_scale,
+        m_indices=m_indices,
+        bf16_zero_out=moe_buf,
+        NE=num_experts,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        MB=block_m,
+    )
+    sorted_scale = torch.empty(
+        (max_sorted, model_dim // 32), dtype=torch.uint8, device=device
+    )
+    aiter.mxfp4_moe_sort_scales(
+        a_scale=a_scale,
+        sorted_token_ids=sorted_token_ids,
+        cumsum_tensor=num_valid_ids,
+        a_scale_sorted_shuffled=sorted_scale,
+        NE=num_experts,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        MB=block_m,
+        max_sorted=max_sorted,
+    )
+    return (
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        a_quant,
+        sorted_scale.view(dtypes.fp8_e8m0),
+    )
+
+
 # `output`: caller-provided [M, model_dim] destination.
 #
 #     path                                      in-place?  why?
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (a4w4, atomic)          yes        K3 threads output as atomic moe_buf
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -249,7 +339,8 @@ def _moe_sorting_impl(
     if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # Thread `output` as moe_buf so atomic gemm2 writes in place; the sort
+        # zeroes it first.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -260,6 +351,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     # -- Opus / CK standard path --
@@ -562,11 +654,11 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
-    stage2_scatter: Stage2ScatterContext | None = None,
     # Optional [M, model_dim] destination for the result, to save the caller a
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    stage2_scatter: Stage2ScatterContext | None = None,
 ):
     if (
         any(
@@ -577,7 +669,15 @@ def fused_moe(
     ):
         from aiter.fhmoe import _fhmoe
 
-        return _fhmoe(
+        # fhmoe has no output slot of its own, so honor `output` with a copy.
+        _validate_output_buffer_metadata(
+            output,
+            (topk_ids.shape[0], w2.shape[1]),
+            hidden_states.dtype if dtype is None else dtype,
+            hidden_states.device,
+        )
+        _validate_output_buffer_no_overlap(output, hidden_states)
+        fhmoe_out = _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -608,6 +708,7 @@ def fused_moe(
             shared_expert_id=shared_expert_id,
             output=output,
         )
+        return _return_output(fhmoe_out, output)
     if not block_size_M:
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
@@ -638,6 +739,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        output=output,
         ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
         ep_combine_input_offset=(
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
@@ -650,7 +752,6 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
-        output=output,
     )
 
 
@@ -679,16 +780,18 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    # Unused, but torch fills the fake positionally from fused_moe_'s schema,
+    # so the parameter lists must line up.
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    output: torch.Tensor | None = None,
     ep_arena_handle: int = 0,
     ep_combine_input_offset: int = 0,
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -739,13 +842,13 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    output: torch.Tensor | None = None,
     ep_arena_handle: int = 0,
     ep_combine_input_offset: int = 0,
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -783,8 +886,8 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        stage2_scatter=stage2_scatter,
         output=output,
+        stage2_scatter=stage2_scatter,
     )
 
 
@@ -814,8 +917,8 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    stage2_scatter: Stage2ScatterContext | None = None,
     output: torch.Tensor | None = None,
+    stage2_scatter: Stage2ScatterContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1030,11 +1133,57 @@ def _fused_moe_impl(
     assert not metadata.flat or get_gfx() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    ), (
+        f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    )
 
     sort_m_indices = None
     sort_reverse_sorted = None
-    if metadata.output_aux:
+    prequantized_a1 = None
+    prequantized_a1_scale = None
+    use_k3_fused_sort_quant = (
+        _MOE_A8W4_FUSED_SORT_QUANT
+        and not metadata.output_aux
+        and not metadata.flat
+        and not metadata.run_1stage
+        and expert_mask is None
+        and num_local_tokens is None
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and global_E == 896
+        and topk == 16
+        and block_size_M == 32
+        and model_dim == 3584
+        and hidden_states.dtype == dtypes.bf16
+        and topk_ids.dtype == dtypes.i32
+        and topk_ids.is_contiguous()
+        and topk_weight.dtype == dtypes.fp32
+        and topk_weight.is_contiguous()
+        and not stage2_uses_route_reduce(metadata.stage2)
+    )
+    if use_k3_fused_sort_quant:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = _k3_a8w4_fused_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            output=output,
+            num_experts=global_E,
+            topk=topk,
+            block_m=block_size_M,
+            model_dim=model_dim,
+            dtype=dtype,
+        )
+        local_topk_ids = None
+    elif metadata.output_aux:
         # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
         # not thread expert_mask into moe_sorting below -- EP masking would be
         # silently ignored and tokens routed to the wrong experts. Fail loudly
@@ -1128,7 +1277,7 @@ def _fused_moe_impl(
         return _return_output(_stage1_call(), output)
     else:
         ret = fused_moe_2stages(
-            hidden_states,
+            prequantized_a1 if prequantized_a1 is not None else hidden_states,
             w1,
             w2,
             topk,
@@ -1146,7 +1295,9 @@ def _fused_moe_impl(
             q_dtype_w=q_dtype_w,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            a1_scale=a1_scale,
+            a1_scale=(
+                prequantized_a1_scale if prequantized_a1_scale is not None else a1_scale
+            ),
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
@@ -3210,7 +3361,9 @@ def fused_moe_2stages(
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
         # mxfp8 activations + mxfp4 weights (a8w4) OR mxfp8 weights (a8w8).
-        if _MOE_A8W4_BYPASS_QUANT:
+        if hidden_states.dtype == dtypes.fp8 and a1_scale is not None:
+            a1 = hidden_states
+        elif _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.
             a1 = hidden_states.to(dtypes.fp8)
             M = sorted_ids.shape[0]
@@ -3279,9 +3432,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert (
-            a1_scale is not None or quant_type == QuantType.No
-        ), "a1_scale must be provided for quantized input for fused_moe"
+        assert a1_scale is not None or quant_type == QuantType.No, (
+            "a1_scale must be provided for quantized input for fused_moe"
+        )
         a1 = hidden_states
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
     # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
