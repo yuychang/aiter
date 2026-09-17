@@ -32,6 +32,7 @@ def gated_rmsnorm_fp8_per_token_quant(
     z: Tensor,
     weight: Tensor,
     epsilon: float,
+    sigmoid_gate: bool = False,
 ) -> None:
     """
     HIP kernel for fused Gated RMSNorm + FP8 per-token quantization.
@@ -43,6 +44,8 @@ def gated_rmsnorm_fp8_per_token_quant(
         z: [num_tokens, num_heads, head_dim] gating tensor (bf16/fp16)
         weight: [head_dim] RMSNorm weight (bf16/fp16)
         epsilon: numerical stability epsilon
+        sigmoid_gate: use sigmoid(z), as required by Kimi-K3 KDA, instead of
+            the default SiLU(z)
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """
