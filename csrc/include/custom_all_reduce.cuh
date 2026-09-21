@@ -740,15 +740,8 @@ __global__ void __launch_bounds__(512, 1)
         int dst_idx = (warp_id + rank) % ngpus * part + idx;
         P reduced   = tmps[warp_id][idx];
         P res       = ((const P*)residual)[dst_idx];
-        A add_reg;
-#pragma unroll
-        for(int i = 0; i < pack_size; ++i)
-            add_reg[i] = upcast_s(reduced[i]) + upcast_s(res[i]);
-        P write_reg;
-#pragma unroll
-        for(int i = 0; i < pack_size; ++i)
-            write_reg[i] = downcast_s<T>(add_reg[i]);
-        ((P*)result)[dst_idx] = write_reg;
+        packed_assign_add<T, pack_size>(reduced, res);
+        ((P*)result)[dst_idx] = reduced;
     }
 }
 

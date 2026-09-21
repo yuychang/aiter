@@ -459,7 +459,7 @@ void all_reduce(fptr_t _fa,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
 }
 
-// Residual 1-/2-stage epilogues are defined in custom_all_reduce.cuh.
+// Residual 1-/2-stage epilogues use packed BF16 addition in the header.
 void all_reduce_residual(fptr_t _fa,
                          const aiter_tensor_t& inp,
                          const aiter_tensor_t& out,
