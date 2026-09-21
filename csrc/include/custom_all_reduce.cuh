@@ -21,6 +21,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -4978,6 +4979,16 @@ class CustomAllreduce
                          : std::min(kMaxBlocks,
                                     (size / world_size_ + (threads / world_size_) - 1) /
                                         (threads / world_size_));
+        if(call_2stage)
+        {
+            if(const char* override_blocks =
+                   std::getenv("AITER_AR_RESIDUAL_2STAGE_BLOCKS"))
+            {
+                int requested = std::atoi(override_blocks);
+                if(requested > 0 && requested <= kMaxBlocks)
+                    blocks = requested;
+            }
+        }
 
 #define KL_RES(ngpus)                                                                      \
     do                                                                                     \
