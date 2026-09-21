@@ -4741,6 +4741,8 @@ class CustomAllreduce
             {
                 if(numel <= 4 * 8192)
                     ll_bs = 256;
+                else if(numel <= 8 * 8192)
+                    ll128_bs = 256;
             }
             else if(world_size_ == 4)
             {
