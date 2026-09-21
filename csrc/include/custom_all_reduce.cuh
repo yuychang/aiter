@@ -664,6 +664,94 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     }
 }
 
+// Two-stage AR with the replicated residual folded into the all-gather
+// writeback. Stage 1 is identical to cross_device_reduce_2stage; stage 2 adds
+// the destination element after the reduced value has rounded to T, matching
+// split AR followed by the aggregation kernel's residual add.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_res(RankData* _input_dp,
+                                   RankData* _output_dp,
+                                   RankSignals sg,
+#ifndef USE_ROCM
+                                   volatile
+#endif
+                                   Signal* self_sg,
+                                   T* __restrict__ result,
+                                   const T* __restrict__ residual,
+                                   int rank,
+                                   int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int tid                 = blockIdx.x * tnum_gpu + lane_id;
+    int stride              = gridDim.x * tnum_gpu;
+    int part                = size / ngpus;
+    int start               = rank * part;
+    int end                 = rank == ngpus - 1 ? size : start + part;
+    int largest_part        = part + size % ngpus;
+    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
+    }
+    auto tmp_out = tmps[0];
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int idx = start + tid; idx < end; idx += stride)
+    {
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        __syncthreads();
+        if(warp_id == 0)
+        {
+            A add_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
+            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
+#pragma unroll
+            for(int i = 1; i < ngpus; ++i)
+            {
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    add_reg[j] +=
+                        upcast_s(tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+            }
+            P write_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                write_reg[i] = downcast_s<T>(add_reg[i]);
+            tmp_out[idx - start] = write_reg;
+        }
+        __syncthreads();
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+
+    for(int idx = tid; idx < largest_part; idx += stride)
+    {
+        int dst_idx = (warp_id + rank) % ngpus * part + idx;
+        P reduced   = tmps[warp_id][idx];
+        P res       = ((const P*)residual)[dst_idx];
+        A add_reg;
+#pragma unroll
+        for(int i = 0; i < pack_size; ++i)
+            add_reg[i] = upcast_s(reduced[i]) + upcast_s(res[i]);
+        P write_reg;
+#pragma unroll
+        for(int i = 0; i < pack_size; ++i)
+            write_reg[i] = downcast_s<T>(add_reg[i]);
+        ((P*)result)[dst_idx] = write_reg;
+    }
+}
+
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage_write_mode(RankData* _input_dp,
@@ -4840,8 +4928,8 @@ class CustomAllreduce
 #undef KL
 }
 
-    // 1-stage custom AR with a fused residual add. Throws for sizes that would
-    // take the 2-stage kernel, which this entry point does not specialize.
+    // Custom AR with a fused residual add. Uses the same 1-/2-stage crossover
+    // as plain allreduce; the 2-stage path folds the add into all-gather.
     template <typename T>
     void allreduce_residual(hipStream_t stream,
                             T* input,
@@ -4868,37 +4956,53 @@ class CustomAllreduce
         size /= d;
 
         bool call_1stage = false;
+        bool call_2stage = false;
         if(world_size_ == 2)
             call_1stage = true;
         else if(full_nvlink_)
         {
-            // Residual fusion is 1-stage only. Allow a small overshoot past
-            // the plain-AR 80 KiB TP8 crossover so M=8 (112 KiB) can fold the
-            // attn-res add. Do not change CustomAllreduce::allreduce.
             if((world_size_ <= 4 && bytes < 160 * 1024) ||
-               (world_size_ <= 8 && bytes < 128 * 1024))
+               (world_size_ <= 8 && bytes < 80 * 1024))
                 call_1stage = true;
+            else
+                call_2stage = true;
         }
-        if(!call_1stage)
+        if(!call_1stage && !call_2stage)
             throw std::runtime_error(
-                "allreduce_residual is only implemented for the 1-stage custom AR");
+                "allreduce_residual requires fully connected peers");
 
-        int blocks = std::min(kMaxBlocks,
-                              (size + (threads / world_size_) - 1) / (threads / world_size_));
+        int blocks = call_1stage
+                         ? std::min(kMaxBlocks,
+                                    (size + (threads / world_size_) - 1) /
+                                        (threads / world_size_))
+                         : std::min(kMaxBlocks,
+                                    (size / world_size_ + (threads / world_size_) - 1) /
+                                        (threads / world_size_));
 
 #define KL_RES(ngpus)                                                                      \
     do                                                                                     \
     {                                                                                      \
-        if(is_broadcast_reg_outptr)                                                        \
+        if(call_1stage && is_broadcast_reg_outptr)                                         \
         {                                                                                  \
             cross_device_reduce_1stage_res<T, ngpus, true><<<blocks, threads, 0, stream>>>( \
                 input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size);    \
         }                                                                                  \
-        else                                                                               \
+        else if(call_1stage)                                                               \
         {                                                                                  \
             cross_device_reduce_1stage_res<T, ngpus, false>                                \
                 <<<blocks, threads, 0, stream>>>(                                          \
                     input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
+        }                                                                                  \
+        else if(bytes % (ngpus * 16) == 0)                                                 \
+        {                                                                                  \
+            cross_device_reduce_2stage_res<T, ngpus, false>                                \
+                <<<blocks, threads, 0, stream>>>(                                          \
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
+        }                                                                                  \
+        else                                                                               \
+        {                                                                                  \
+            throw std::runtime_error(                                                      \
+                "2-stage allreduce_residual requires vector-aligned input");              \
         }                                                                                  \
     } while(0)
 
