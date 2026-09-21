@@ -4872,8 +4872,11 @@ class CustomAllreduce
             call_1stage = true;
         else if(full_nvlink_)
         {
+            // Residual fusion is 1-stage only. Allow a small overshoot past
+            // the plain-AR 80 KiB TP8 crossover so M=8 (112 KiB) can fold the
+            // attn-res add. Do not change CustomAllreduce::allreduce.
             if((world_size_ <= 4 && bytes < 160 * 1024) ||
-               (world_size_ <= 8 && bytes < 80 * 1024))
+               (world_size_ <= 8 && bytes < 128 * 1024))
                 call_1stage = true;
         }
         if(!call_1stage)
