@@ -4978,11 +4978,6 @@ class CustomAllreduce
                          : std::min(kMaxBlocks,
                                     (size / world_size_ + (threads / world_size_) - 1) /
                                         (threads / world_size_));
-        // The K3 TP8 M=8 BF16 residual path benefits from more independent
-        // reduce-scatter workgroups than the exact-coverage launch (14).
-        if(call_2stage && world_size_ == 8 && bytes == 8 * 7168 * 2)
-            blocks = 24;
-
 #define KL_RES(ngpus)                                                                      \
     do                                                                                     \
     {                                                                                      \
