@@ -1253,12 +1253,18 @@ class CustomAllreduce:
         """Out-of-place 1-stage all-reduce with a fused residual add.
 
         ``residual`` must be identical on every rank. Returns None when this
-        size would take 2-stage AR or the residual kernel is unavailable.
+        size is too large for the 1-stage residual kernel.
         """
         if self.disabled or self._ops_all_reduce_residual is None:
             return None
+        # Residual fusion always uses the 1-stage kernel. Keep the plain AR
+        # 1-stage/2-stage crossover unchanged so fused AR+RMSNorm still sees
+        # 2-stage at TP8 M=8 (112 KiB). Allow a small overshoot for residual
+        # only; M=16 is 224 KiB and stays on split AR.
         if not self.uses_1stage_ar(inp):
-            return None
+            nbytes = inp.numel() * inp.element_size()
+            if nbytes >= 128 * 1024:
+                return None
         if residual.shape != inp.shape or residual.dtype != inp.dtype:
             return None
         if out is None:
