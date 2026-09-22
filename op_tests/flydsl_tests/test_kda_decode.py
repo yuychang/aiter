@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness tests for the fused FlyDSL Kimi-K3 KDA decode path."""
+"""Correctness tests for the fused FlyDSL KDA decode specialization."""
 
 from __future__ import annotations
 
@@ -12,22 +12,15 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kimi_k3_kda_decode import (
-    flydsl_kimi_k3_kda_decode,
-    flydsl_kimi_k3_kda_decode_with_f_b,
-    is_flydsl_kimi_k3_kda_decode_supported,
+from aiter.ops.flydsl.kda_decode import (
+    flydsl_kda_decode,
+    flydsl_kda_decode_with_f_b,
+    is_flydsl_kda_decode_supported,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
-        return False
-    try:
-        return get_gfx() == "gfx950"
-    except (AssertionError, KeyError, RuntimeError):
-        return False
+    return is_flydsl_kda_decode_supported()
 
 
 pytestmark = pytest.mark.skipif(
@@ -271,7 +264,7 @@ def _relative_rmse(
 
 
 def _run(inputs: Inputs) -> torch.Tensor:
-    return flydsl_kimi_k3_kda_decode(
+    return flydsl_kda_decode(
         x=inputs.x,
         conv_weight=inputs.conv_weight,
         conv_bias=None,
@@ -324,7 +317,7 @@ def _run_with_f_b(
     f_b_weight: torch.Tensor,
     inputs: Inputs,
 ) -> torch.Tensor:
-    return flydsl_kimi_k3_kda_decode_with_f_b(
+    return flydsl_kda_decode_with_f_b(
         f_a=f_a,
         f_b_weight=f_b_weight,
         x=inputs.x,
@@ -346,26 +339,33 @@ def _run_with_f_b(
 def test_public_api_and_support_predicate() -> None:
     import aiter.ops.flydsl as flydsl_ops
 
-    assert flydsl_ops.flydsl_kimi_k3_kda_decode is flydsl_kimi_k3_kda_decode
-    assert (
-        flydsl_ops.is_flydsl_kimi_k3_kda_decode_supported
-        is is_flydsl_kimi_k3_kda_decode_supported
-    )
-    assert is_flydsl_kimi_k3_kda_decode_supported(0)
-    assert not is_flydsl_kimi_k3_kda_decode_supported("cpu")
+    assert flydsl_ops.flydsl_kda_decode is flydsl_kda_decode
+    assert flydsl_ops.is_flydsl_kda_decode_supported is is_flydsl_kda_decode_supported
+    assert is_flydsl_kda_decode_supported(0)
+    assert not is_flydsl_kda_decode_supported("cpu")
 
 
 def test_f_b_public_api() -> None:
     import aiter.ops.flydsl as flydsl_ops
 
-    assert (
-        flydsl_ops.flydsl_kimi_k3_kda_decode_with_f_b
-        is flydsl_kimi_k3_kda_decode_with_f_b
-    )
+    assert flydsl_ops.flydsl_kda_decode_with_f_b is flydsl_kda_decode_with_f_b
+
+
+def test_decode_module_exports() -> None:
+    import aiter.ops.flydsl as flydsl_ops
+    from aiter.ops.flydsl import kda_decode
+
+    expected = {
+        "flydsl_kda_decode",
+        "flydsl_kda_decode_with_f_b",
+        "is_flydsl_kda_decode_supported",
+    }
+    assert set(kda_decode.__all__) == expected
+    assert expected <= set(flydsl_ops.__all__)
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
+def test_kda_decode_matches_reference(batch: int) -> None:
     seed = _make_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
@@ -374,7 +374,7 @@ def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
     actual = _run(actual_inputs)
     torch.cuda.synchronize()
 
-    assert is_flydsl_kimi_k3_kda_decode_supported(_DEVICE)
+    assert is_flydsl_kda_decode_supported(_DEVICE)
     assert not torch.isnan(actual).any()
     assert _relative_rmse(reference, actual) < 1e-3
     assert (
@@ -405,7 +405,7 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
+def test_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)

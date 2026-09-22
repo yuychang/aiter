@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level API for the fused Kimi-K3 KDA decode specialization."""
+"""High-level API for fused KDA decode on gfx950 with 12 heads and dim 128."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ from collections.abc import Iterable
 
 import torch
 
-from .kernels.kimi_k3_kda_decode import (
-    create_kimi_k3_kda_decode_kernel,
+from .kernels.kda_decode_gfx950 import (
+    create_kda_decode_kernel,
 )
-from .kernels.kimi_k3_kda_decode_fb import (
-    create_kimi_k3_kda_decode_fb_kernel,
+from .kernels.kda_decode_fused_projection_gfx950 import (
+    create_kda_decode_fused_projection_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
 
@@ -31,7 +31,7 @@ def _rocm_arch(device: torch.device) -> str | None:
     return arch.split(":", 1)[0] if arch is not None else None
 
 
-def is_flydsl_kimi_k3_kda_decode_supported(
+def is_flydsl_kda_decode_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
     """Return whether ``device`` can run this gfx950-only specialization."""
@@ -115,7 +115,7 @@ def _validate_kda_inputs(
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Validate operands shared by both explicit KDA specializations."""
-    if not is_flydsl_kimi_k3_kda_decode_supported(device):
+    if not is_flydsl_kda_decode_supported(device):
         raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
         raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
@@ -243,7 +243,7 @@ def _validate_kda_inputs(
     return out
 
 
-def flydsl_kimi_k3_kda_decode(
+def flydsl_kda_decode(
     x: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: torch.Tensor | None,
@@ -260,17 +260,12 @@ def flydsl_kimi_k3_kda_decode(
     norm_eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run fused Kimi-K3 KDA decode on MI350-series GPUs.
+    """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
 
-    This pure-decode specialization fuses the packed width-4 Q/K/V causal
-    convolution, the FP32 recurrent-state update, and the BF16
-    RMSNorm/sigmoid output gate. Slot zero is reserved: non-positive
-    ``state_indices`` produce zero output without modifying either cache.
-
-    The layout is fixed to Kimi-K3 TP8: 12 local heads and 128-dimensional
-    key/value state. Call
-    :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
-    model implementation.
+    Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
+    :func:`is_flydsl_kda_decode_supported` before dispatch.
+    Uses RMSNorm/sigmoid gating. Non-positive ``state_indices`` produce zero
+    output and leave both caches unchanged.
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
@@ -279,7 +274,7 @@ def flydsl_kimi_k3_kda_decode(
     device = x.device
     batch = x.shape[0]
     out = _validate_kda_inputs(
-        api_name="flydsl_kimi_k3_kda_decode",
+        api_name="flydsl_kda_decode",
         batch_source="x",
         device=device,
         batch=batch,
@@ -307,7 +302,7 @@ def flydsl_kimi_k3_kda_decode(
         inner_strides=(_DIM, 1),
     )
 
-    executable = create_kimi_k3_kda_decode_kernel(
+    executable = create_kda_decode_kernel(
         float(norm_eps),
         float(lower_bound),
     )
@@ -346,7 +341,7 @@ def flydsl_kimi_k3_kda_decode(
     return out
 
 
-def flydsl_kimi_k3_kda_decode_with_f_b(
+def flydsl_kda_decode_with_f_b(
     f_a: torch.Tensor,
     f_b_weight: torch.Tensor,
     x: torch.Tensor,
@@ -364,12 +359,10 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
     norm_eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the explicit gfx950 Kimi-K3 f_b plus KDA decode specialization.
+    """Run :func:`flydsl_kda_decode` with a fused head-local ``f_b`` projection.
 
-    The kernel consumes ``f_a`` and the head-local ``f_b_weight`` directly,
-    accumulates the projection in FP32, and rounds once to BF16 before the KDA
-    lower-bound decay gate. It does not materialize the projected raw-g tensor
-    in global memory.
+    Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
+    before the lower-bound decay gate, without storing raw-g in global memory.
     """
     if f_a.ndim != 2:
         raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
@@ -395,7 +388,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
         inner_strides=(_DIM, 1),
     )
     out = _validate_kda_inputs(
-        api_name="flydsl_kimi_k3_kda_decode_with_f_b",
+        api_name="flydsl_kda_decode_with_f_b",
         batch_source="f_a",
         device=device,
         batch=batch,
@@ -414,7 +407,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
         out=out,
     )
 
-    executable = create_kimi_k3_kda_decode_fb_kernel(
+    executable = create_kda_decode_fused_projection_kernel(
         float(norm_eps),
         float(lower_bound),
     )
@@ -457,7 +450,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
 
 
 __all__ = [
-    "flydsl_kimi_k3_kda_decode",
-    "flydsl_kimi_k3_kda_decode_with_f_b",
-    "is_flydsl_kimi_k3_kda_decode_supported",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
+    "is_flydsl_kda_decode_supported",
 ]

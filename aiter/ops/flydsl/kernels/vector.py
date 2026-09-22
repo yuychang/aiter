@@ -2,27 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Vector dialect wrappers, vendored into aiter.
+"""Vendored FlyDSL vector wrappers for fused KDA kernels.
 
-flydsl deleted ``flydsl.expr.vector``; callers are now expected to use the raw
-``flydsl._mlir.dialects.vector`` and wrap every operand in ``as_ir_value``. A
-missing ``as_ir_value`` or ``kDynamic`` sentinel only surfaces at trace time,
-so this auto-unwrapping layer is kept instead.
-
-Upstream aiter deleted this file in 08d73a192 (#5303) once it had migrated its
-own call sites. The Kimi-K3 gfx950 kernels -- here, and the copies vendored in
-sglang under ``sglang/kernels/ops/kimi_k3/flydsl/`` -- still call the wrappers;
-drop this file once those migrate to the raw dialect.
-
-Re-exports the whole raw dialect (``broadcast``, ``shuffle``, ``insert``,
-``extract_strided_slice``, ``reduction``, ...) and rebuilds the five wrappers
-that unwrap DSL values: ``from_elements``, ``store``, ``extract``,
-``load_op``, ``bitcast``. ``extract`` also supplies the ``kDynamic`` sentinel
-for dynamic positions. Only published flydsl APIs are used.
-
-Upstream: FlyDSL ``python/flydsl/expr/vector.py``, deleted before
-ROCm/FlyDSL#880; the wrappers use FlyDSL's canonical ``as_ir_value``
-converter.
+Re-exports the raw dialect, unwraps DSL values, and fills dynamic-index
+sentinels. Remove once KDA callers use the raw dialect or typed vector API.
+Source: FlyDSL ``python/flydsl/expr/vector.py`` (removed before ROCm/FlyDSL#880).
 """
 
 from __future__ import annotations
@@ -69,7 +53,7 @@ def _as_index_ir_value(value):
 
 @dsl_loc_tracing
 def from_elements(*args, **kwargs):
-    """Construct a vector from scalar elements, auto-unwrapping ArithValue wrappers."""
+    """Build a vector from scalars, unwrapping DSL values."""
     if len(args) >= 2:
         args = list(args)
         elems = args[1]
@@ -82,7 +66,7 @@ def from_elements(*args, **kwargs):
 
 @dsl_loc_tracing
 def store(value, memref, indices, **kwargs):
-    """Vector store wrapper that accepts ArithValue/wrappers for value/indices."""
+    """Store a vector, unwrapping DSL values and converting indices."""
     return _vector.store(
         as_ir_value(value),
         as_ir_value(memref),
@@ -98,14 +82,7 @@ def store(value, memref, indices, **kwargs):
 
 @dsl_loc_tracing
 def extract(vector, static_position=None, dynamic_position=None):
-    """Wrapper around `vector.ExtractOp(...).result`.
-
-    When only ``dynamic_position`` is supplied (without explicit
-    ``static_position``), each dynamic index needs a corresponding
-    ``kDynamic`` sentinel in the static attribute so the ODS builder
-    pairs them correctly.  This wrapper fills in the sentinels
-    automatically.
-    """
+    """Extract vector elements, filling missing dynamic-index sentinels."""
     if static_position is None:
         static_position = []
     if dynamic_position is None:
@@ -127,7 +104,7 @@ def extract(vector, static_position=None, dynamic_position=None):
 
 @dsl_loc_tracing
 def load_op(result_type, memref, indices):
-    """Wrapper around `vector.LoadOp(...).result`."""
+    """Load a vector, unwrapping DSL values and converting indices."""
     return _vector.LoadOp(
         result_type,
         as_ir_value(memref),
@@ -137,7 +114,7 @@ def load_op(result_type, memref, indices):
 
 @dsl_loc_tracing
 def bitcast(result_type, source):
-    """Wrapper around `vector.BitCastOp(...).result`."""
+    """Bitcast a vector, unwrapping its DSL value."""
     return _vector.BitCastOp(
         result_type,
         as_ir_value(source),

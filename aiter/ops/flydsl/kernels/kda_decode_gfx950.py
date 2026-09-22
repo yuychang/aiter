@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL Kimi-K3 KDA decode with a fused head-local f_b projection."""
+"""FlyDSL fused KDA decode kernel on gfx950 with 12 heads and dim 128."""
 
 import functools
 import math
@@ -33,34 +33,30 @@ _K_ITERS = _DIM // _WARP_TILE_K
 _WARP_THREADS_V = _WARP_SIZE // _WARP_THREADS_K
 _V_GROUP_TILE = _NUM_WARPS * _WARP_THREADS_V
 _V_ITERS = _DIM // _V_GROUP_TILE
-_PROJECTION_VECTOR = 4
-_PROJECTION_ITERS = _DIM // _PROJECTION_VECTOR
-_WAVES_PER_EU = 2
+_WAVES_PER_EU = 3
 
 
 @functools.cache
-def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
-    """Build the fixed gfx950 BF16 f_b plus KDA decode specialization."""
+def create_kda_decode_kernel(norm_eps: float, lower_bound: float):
+    """Build the fixed gfx950 BF16 KDA decode specialization."""
 
     @fx.struct
     class SharedStorage:
         q: fx.Array[fx.BFloat16, _DIM, 16]
         k: fx.Array[fx.BFloat16, _DIM, 16]
         v: fx.Array[fx.BFloat16, _DIM, 16]
-        gate: fx.Array[fx.BFloat16, _DIM, 16]
         recurrent_out: fx.Array[fx.BFloat16, _DIM, 16]
         norm_partial: fx.Array[fx.Float32, 2, 16]
 
     @flyc.kernel(
-        name="kimi_k3_kda_decode_fb_bf16_gfx950",
+        name="kda_decode_bf16_gfx950",
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def kernel(
-        f_a_mem: fx.Tensor,
-        f_b_weight_mem: fx.Tensor,
         x_mem: fx.Tensor,
         weight_mem: fx.Tensor,
         conv_state_mem: fx.Tensor,
+        raw_g_mem: fx.Tensor,
         raw_beta_mem: fx.Tensor,
         A_log_mem: fx.Tensor,
         dt_bias_mem: fx.Tensor,
@@ -70,15 +66,13 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         norm_weight_mem: fx.Tensor,
         out_mem: fx.Tensor,
         batch_size: fx.Int32,
-        stride_f_a_token: fx.Int32,
-        stride_f_b_head: fx.Int32,
-        stride_f_b_output: fx.Int32,
         stride_x_token: fx.Int32,
         stride_weight_channel: fx.Int32,
         stride_weight_width: fx.Int32,
         stride_conv_slot: fx.Int32,
         stride_conv_channel: fx.Int32,
         stride_conv_width: fx.Int32,
+        stride_g_token: fx.Int32,
         stride_beta_token: fx.Int32,
         stride_state_slot: fx.Int32,
         stride_gate_token: fx.Int32,
@@ -88,11 +82,10 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
     ):
         del batch_size
 
-        f_a = GTensor(f_a_mem, dtype=T.bf16, shape=(-1,))
-        f_b_weight = GTensor(f_b_weight_mem, dtype=T.bf16, shape=(-1,))
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         weight = GTensor(weight_mem, dtype=T.f32, shape=(-1,))
         conv_state = GTensor(conv_state_mem, dtype=T.bf16, shape=(-1,))
+        raw_g = GTensor(raw_g_mem, dtype=T.bf16, shape=(-1,))
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
@@ -106,7 +99,6 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         q_lds = shared.q.ptr
         k_lds = shared.k.ptr
         v_lds = shared.v.ptr
-        gate_lds = shared.gate.ptr
         out_lds = shared.recurrent_out.ptr
         norm_lds = shared.norm_partial.ptr
 
@@ -123,48 +115,6 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
 
         valid_if = scf.IfOp(_to_raw(valid), results_=[], has_else=True)
         with ir.InsertionPoint(valid_if.then_block):
-            # Threads 0..127 own one output each. Accumulation is FP32 and the
-            # single BF16 store is the same numerical boundary as F.linear.
-            projection_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
-            )
-            with ir.InsertionPoint(projection_if.then_block):
-                vec_f32_projection = T.vec(_PROJECTION_VECTOR, T.f32)
-                accum = fx.full(
-                    _PROJECTION_VECTOR,
-                    0.0,
-                    fx.Float32,
-                )
-                f_a_base = batch * stride_f_a_token
-                f_b_base = head * stride_f_b_head + tid * stride_f_b_output
-                for projection_iter in range_constexpr(_PROJECTION_ITERS):
-                    projection_offset = fx.Int32(projection_iter * _PROJECTION_VECTOR)
-                    f_a_values = f_a.vec_load(
-                        (f_a_base + projection_offset,),
-                        _PROJECTION_VECTOR,
-                    ).extf(vec_f32_projection)
-                    weight_values = f_b_weight.vec_load(
-                        (f_b_base + projection_offset,),
-                        _PROJECTION_VECTOR,
-                    ).extf(vec_f32_projection)
-                    accum = mlir_vector.FMAOp(
-                        f_a_values,
-                        weight_values,
-                        accum,
-                    ).result
-                projected = mlir_vector.ReductionOp(
-                    T.f32,
-                    vector.CombiningKind.ADD,
-                    accum,
-                ).dest
-                fx.ptr_store(
-                    fx.BFloat16(projected),
-                    gate_lds + tid,
-                )
-                scf.YieldOp([])
-
             # A workgroup exclusively owns all three convolution channels for
             # its (batch, head), so every cache entry is shifted exactly once.
             conv_if = scf.IfOp(
@@ -227,8 +177,6 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                 fx.ptr_store(v_conv, v_lds + tid)
                 scf.YieldOp([])
 
-            # Both projection and convolution LDS values must be visible
-            # before the recurrent core begins.
             fx.gpu.barrier()
 
             # Four waves split V into 32-row groups. Eight-lane subgroups
@@ -285,10 +233,9 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                     ).dest
                 )
 
-                # The projection is rounded in LDS before the lower-bound gate.
-                gate_bf16 = fx.ptr_load(
-                    gate_lds + k_base,
-                    result_type=vec_bf16,
+                gate_bf16 = raw_g.vec_load(
+                    (batch * stride_g_token + head * fx.Int32(_DIM) + k_base,),
+                    _VALUES_PER_THREAD_K,
                 )
                 gate_f32 = gate_bf16.extf(vec_f32)
                 dt = dt_bias.vec_load(
@@ -546,11 +493,10 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
 
     @flyc.jit
     def launch(
-        f_a_mem: fx.Tensor,
-        f_b_weight_mem: fx.Tensor,
         x_mem: fx.Tensor,
         weight_mem: fx.Tensor,
         conv_state_mem: fx.Tensor,
+        raw_g_mem: fx.Tensor,
         raw_beta_mem: fx.Tensor,
         A_log_mem: fx.Tensor,
         dt_bias_mem: fx.Tensor,
@@ -560,15 +506,13 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         norm_weight_mem: fx.Tensor,
         out_mem: fx.Tensor,
         batch_size: fx.Int32,
-        stride_f_a_token: fx.Int32,
-        stride_f_b_head: fx.Int32,
-        stride_f_b_output: fx.Int32,
         stride_x_token: fx.Int32,
         stride_weight_channel: fx.Int32,
         stride_weight_width: fx.Int32,
         stride_conv_slot: fx.Int32,
         stride_conv_channel: fx.Int32,
         stride_conv_width: fx.Int32,
+        stride_g_token: fx.Int32,
         stride_beta_token: fx.Int32,
         stride_state_slot: fx.Int32,
         stride_gate_token: fx.Int32,
@@ -578,11 +522,10 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel(
-            f_a_mem,
-            f_b_weight_mem,
             x_mem,
             weight_mem,
             conv_state_mem,
+            raw_g_mem,
             raw_beta_mem,
             A_log_mem,
             dt_bias_mem,
@@ -592,15 +535,13 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
             norm_weight_mem,
             out_mem,
             batch_size,
-            stride_f_a_token,
-            stride_f_b_head,
-            stride_f_b_output,
             stride_x_token,
             stride_weight_channel,
             stride_weight_width,
             stride_conv_slot,
             stride_conv_channel,
             stride_conv_width,
+            stride_g_token,
             stride_beta_token,
             stride_state_slot,
             stride_gate_token,
@@ -622,4 +563,4 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
     return launch
 
 
-__all__ = ["create_kimi_k3_kda_decode_fb_kernel"]
+__all__ = ["create_kda_decode_kernel"]
