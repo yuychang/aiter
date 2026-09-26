@@ -1277,8 +1277,18 @@ class CustomAllreduce:
         return out
 
     def custom_all_reduce_residual(
-        self, input: torch.Tensor, residual: torch.Tensor
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
+        """Residual is read in place and never stored.
+
+        ``out`` is optional. Callers that capture a CUDA graph pass a buffer
+        allocated on the capturing stream and must not keep a shape-keyed
+        cache of that buffer or of ``residual``: replacing either pointer
+        frees storage the graph still replays.
+        """
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
@@ -1286,10 +1296,13 @@ class CustomAllreduce:
                 return self.all_reduce_residual(
                     input,
                     residual,
+                    out=out,
                     registered_input=self.enable_register_for_capturing,
                 )
             return torch.zeros_like(input)
-        return self.all_reduce_residual(input, residual, registered_input=False)
+        return self.all_reduce_residual(
+            input, residual, out=out, registered_input=False
+        )
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False

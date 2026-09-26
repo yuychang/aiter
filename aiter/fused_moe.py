@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -139,54 +140,141 @@ def _take_k3_presorted_moe(topk_ids, *, block_m, num_experts, topk):
 # Stage1's intermediate is consumed immediately by stage2, so it can be shared
 # across layers. Keyed by stream so overlapping launches stay correct, and by
 # exact shape so graph-baked pointers stay stable.
-_FLYDSL_STAGE1_OUT_CACHE: dict[
-    tuple[torch.device, int, tuple[int, int]], torch.Tensor
-] = {}
-_FLYDSL_STAGE1_FP4_OUT_CACHE: dict[
-    tuple[torch.device, int, tuple[int, int]], torch.Tensor
-] = {}
+#
+# The three scratch families share one byte budget. Entries touched while a
+# CUDA graph is capturing are pinned and never evicted: replay bakes the
+# pointer. Eager prefill shapes stay unpinned and are LRU-evicted. An
+# unbounded dict of those shapes grew 26–35 GiB across GSM8K plus serving.
+_DEFAULT_FLYDSL_SCRATCH_CACHE_MAX_BYTES = 8 * 1024**3
 
-# Stage2's reduce epilog scratch is [M, topk, D], ~1.9 GiB per layer at
-# M=16384. Shared across layers on the same stream like the stage1 scratch.
-_FLYDSL_STAGE2_REDUCE_TARGET_CACHE: dict[
-    tuple[torch.device, int, tuple, torch.dtype], torch.Tensor
-] = {}
+
+class _ScratchEntry:
+    __slots__ = ("tensor", "pinned", "nbytes")
+
+    def __init__(self, tensor: torch.Tensor, pinned: bool, nbytes: int):
+        self.tensor = tensor
+        self.pinned = pinned
+        self.nbytes = nbytes
+
+
+class _FlydslScratchPool:
+    """Exact-shape scratch cache with a shared byte cap.
+
+    ``AITER_FLYDSL_SCRATCH_CACHE_MAX_BYTES`` is the shared budget (default
+    8 GiB). ``0`` disables the cap. A single allocation larger than the cap
+    is still kept. Pinned entries are never replaced and never evicted, so a
+    captured pointer stays valid even when later eager shapes miss the cap.
+    """
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[tuple, _ScratchEntry] = OrderedDict()
+        self._bytes = 0
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    @property
+    def nbytes(self) -> int:
+        return self._bytes
+
+    def pinned_nbytes(self) -> int:
+        return sum(entry.nbytes for entry in self._entries.values() if entry.pinned)
+
+    def count(self, namespace: str | None = None) -> int:
+        if namespace is None:
+            return len(self._entries)
+        return sum(1 for key in self._entries if key[0] == namespace)
+
+    def get(
+        self,
+        namespace: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        alloc,
+    ):
+        stream = torch.cuda.current_stream(device=device).cuda_stream
+        key = (namespace, device, int(stream), tuple(shape), dtype)
+        capturing = bool(torch.cuda.is_current_stream_capturing())
+        entry = self._entries.get(key)
+        if entry is not None:
+            if capturing:
+                entry.pinned = True
+            self._entries.move_to_end(key)
+            return entry.tensor
+        tensor = alloc()
+        nbytes = int(tensor.numel()) * int(tensor.element_size())
+        self._make_room(nbytes)
+        self._entries[key] = _ScratchEntry(tensor, capturing, nbytes)
+        self._bytes += nbytes
+        return tensor
+
+    def _make_room(self, incoming: int) -> None:
+        cap = _flydsl_scratch_cache_max_bytes()
+        if cap is None:
+            return
+        while self._bytes + incoming > cap:
+            victim = None
+            for key, entry in self._entries.items():
+                if not entry.pinned:
+                    victim = key
+                    break
+            if victim is None:
+                return
+            dropped = self._entries.pop(victim)
+            self._bytes -= dropped.nbytes
+
+
+_FLYDSL_SCRATCH_POOL = _FlydslScratchPool()
+
+
+def _flydsl_scratch_cache_max_bytes() -> int | None:
+    raw = os.environ.get("AITER_FLYDSL_SCRATCH_CACHE_MAX_BYTES", "").strip()
+    if raw == "":
+        return _DEFAULT_FLYDSL_SCRATCH_CACHE_MAX_BYTES
+    value = int(raw)
+    if value <= 0:
+        return None
+    return value
+
+
+def flydsl_scratch_cache_bytes() -> int:
+    return _FLYDSL_SCRATCH_POOL.nbytes
+
+
+def _scratch_reuse_enabled(env_name: str) -> bool:
+    return os.environ.get(env_name, "0").lower() in ("1", "true")
 
 
 def _get_flydsl_stage1_out(
     shape: tuple[int, int],
     device: torch.device,
 ) -> torch.Tensor:
-    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
-        "1",
-        "true",
-    ):
+    if not _scratch_reuse_enabled("AITER_FLYDSL_STAGE1_SCRATCH_REUSE"):
         return torch.empty(shape, dtype=dtypes.fp8, device=device)
-    stream = torch.cuda.current_stream(device=device).cuda_stream
-    key = (device, stream, shape)
-    out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
-    if out is None:
-        out = torch.empty(shape, dtype=dtypes.fp8, device=device)
-        _FLYDSL_STAGE1_OUT_CACHE[key] = out
-    return out
+    return _FLYDSL_SCRATCH_POOL.get(
+        "stage1",
+        shape,
+        dtypes.fp8,
+        device,
+        lambda: torch.empty(shape, dtype=dtypes.fp8, device=device),
+    )
 
 
 def _get_flydsl_stage1_fp4_out(
     shape: tuple[int, int],
     device: torch.device,
 ) -> torch.Tensor:
-    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
-        "1",
-        "true",
-    ):
+    if not _scratch_reuse_enabled("AITER_FLYDSL_STAGE1_SCRATCH_REUSE"):
         return torch.empty(shape, dtype=dtypes.fp4x2, device=device)
-    stream = torch.cuda.current_stream(device=device).cuda_stream
-    key = (device, stream, shape)
-    out = _FLYDSL_STAGE1_FP4_OUT_CACHE.get(key)
-    if out is None:
-        out = torch.empty(shape, dtype=dtypes.fp4x2, device=device)
-        _FLYDSL_STAGE1_FP4_OUT_CACHE[key] = out
-    return out
+    return _FLYDSL_SCRATCH_POOL.get(
+        "stage1_fp4",
+        shape,
+        dtypes.fp4x2,
+        device,
+        lambda: torch.empty(shape, dtype=dtypes.fp4x2, device=device),
+    )
 
 
 def _get_flydsl_stage2_reduce_target(
@@ -194,18 +282,15 @@ def _get_flydsl_stage2_reduce_target(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    if os.environ.get("AITER_FLYDSL_STAGE2_SCRATCH_REUSE", "0").lower() not in (
-        "1",
-        "true",
-    ):
+    if not _scratch_reuse_enabled("AITER_FLYDSL_STAGE2_SCRATCH_REUSE"):
         return torch.empty(shape, dtype=dtype, device=device)
-    stream = torch.cuda.current_stream(device=device).cuda_stream
-    key = (device, stream, shape, dtype)
-    out = _FLYDSL_STAGE2_REDUCE_TARGET_CACHE.get(key)
-    if out is None:
-        out = torch.empty(shape, dtype=dtype, device=device)
-        _FLYDSL_STAGE2_REDUCE_TARGET_CACHE[key] = out
-    return out
+    return _FLYDSL_SCRATCH_POOL.get(
+        "stage2",
+        shape,
+        dtype,
+        device,
+        lambda: torch.empty(shape, dtype=dtype, device=device),
+    )
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via

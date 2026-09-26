@@ -5,16 +5,16 @@ import pytest
 import torch
 
 from aiter.fused_moe import (
-    _FLYDSL_STAGE1_OUT_CACHE,
+    _FLYDSL_SCRATCH_POOL,
     _get_flydsl_stage1_out,
 )
 
 
 @pytest.fixture(autouse=True)
 def clear_stage1_out_cache():
-    _FLYDSL_STAGE1_OUT_CACHE.clear()
+    _FLYDSL_SCRATCH_POOL.clear()
     yield
-    _FLYDSL_STAGE1_OUT_CACHE.clear()
+    _FLYDSL_SCRATCH_POOL.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -32,4 +32,4 @@ def test_flydsl_stage1_out_is_reused_per_stream(monkeypatch):
 
     assert reused.data_ptr() == output.data_ptr()
     assert other_stream_output.data_ptr() != output.data_ptr()
-    assert len(_FLYDSL_STAGE1_OUT_CACHE) == 2
+    assert _FLYDSL_SCRATCH_POOL.count("stage1") == 2
