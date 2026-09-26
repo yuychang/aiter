@@ -505,6 +505,30 @@ def _mxfp4_aux_instance_supported(experts, topk, hidden, block_m, zero_init):
     )
 
 
+def _mxfp4_inline_sort_activation_supported(hidden_states) -> bool:
+    """Whether gemm1 inline quant can read this activation.
+
+    A contiguous matrix is the historical contract. A 2D tensor with unit
+    inner stride is that same layout with a wider row pitch: the kernel
+    addresses row ``r`` at ``r * stride(0)`` bytes and then walks ``K``
+    packed bf16 elements (see ``inline_quant_load_kt``). The 128-bit buffer
+    load folds that pitch with ``// 16``, so the pitch and the base pointer
+    have to be 16-byte aligned, and the pitch has to cover the row.
+    """
+    if hidden_states.is_contiguous():
+        return True
+    if hidden_states.dim() != 2 or int(hidden_states.stride(-1)) != 1:
+        return False
+    row_stride = int(hidden_states.stride(0))
+    cols = int(hidden_states.size(-1))
+    if row_stride <= 0 or row_stride < cols:
+        return False
+    row_bytes = row_stride * int(hidden_states.element_size())
+    if row_bytes % 16 != 0 or row_bytes > 0x7FFFFFFF:
+        return False
+    return hidden_states.data_ptr() % 16 == 0
+
+
 def _mxfp4_inline_sort_unsupported(
     metadata,
     hidden_states,
@@ -573,7 +597,12 @@ def _mxfp4_inline_sort_unsupported(
     ):
         return "MXFP4 weight scales are smaller than the padded stride"
 
-    tensors = (hidden_states, w1, w2, topk_ids, w1_scale, w2_scale)
+    if not _mxfp4_inline_sort_activation_supported(hidden_states):
+        return (
+            "activations must be contiguous or 2D with unit inner stride "
+            "and a 16-byte-aligned row pitch"
+        )
+    tensors = (w1, w2, topk_ids, w1_scale, w2_scale)
     if not all(tensor.is_contiguous() for tensor in tensors):
         return "non-contiguous tensors"
     if len({tensor.device for tensor in tensors}) != 1:
