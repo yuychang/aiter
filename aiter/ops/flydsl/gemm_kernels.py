@@ -276,14 +276,8 @@ def flydsl_preshuffle_gemm_a8(
     lds_stage: int = 2,
     enable_scheduler: bool = True,
     split_k: int = 1,
-    residual0: Tensor | None = None,
-    residual1: Tensor | None = None,
 ) -> Tensor:
-    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K.
-
-    When both residuals are present, fuse
-    ``bf16(bf16(gemm) + residual0) + residual1`` into the output epilogue.
-    """
+    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
 
@@ -317,26 +311,6 @@ def flydsl_preshuffle_gemm_a8(
         in_dtype = "int8"
     else:
         raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
-    if (residual0 is None) != (residual1 is None):
-        raise ValueError("[FlyDSL] residual0 and residual1 must be provided together")
-    has_residual_add3 = residual0 is not None
-    if has_residual_add3:
-        assert residual0 is not None and residual1 is not None
-        if split_k != 1:
-            raise ValueError("[FlyDSL] residual add3 does not support split-K")
-        for name, tensor in (("residual0", residual0), ("residual1", residual1)):
-            if (
-                tensor.shape != (m, n)
-                or tensor.dtype != Out.dtype
-                or tensor.device != Out.device
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(
-                    f"[FlyDSL] {name} must be contiguous shape {(m, n)}, "
-                    f"dtype {Out.dtype}, device {Out.device}; got "
-                    f"shape {tuple(tensor.shape)}, dtype {tensor.dtype}, "
-                    f"device {tensor.device}"
-                )
 
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
@@ -364,7 +338,6 @@ def flydsl_preshuffle_gemm_a8(
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
         split_k=int(split_k),
-        epilogue="residual_add3" if has_residual_add3 else "none",
     )
 
     def _as_i8(t):
@@ -390,21 +363,13 @@ def flydsl_preshuffle_gemm_a8(
     _run_compiled(
         exe,
         workspace.view(-1),
-        (
-            residual1.view(-1)
-            if has_residual_add3 and residual1 is not None
-            else out_contig.view(-1)
-        ),
+        out_contig.view(-1),
         semaphore,
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        (
-            residual0.view(-1)
-            if has_residual_add3 and residual0 is not None
-            else dummy_bias
-        ),
+        dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
