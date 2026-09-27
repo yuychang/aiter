@@ -130,7 +130,7 @@ def compile_preshuffle_gemm(
     tile_k: int,
     in_dtype: str = "fp8",
     out_dtype: str = "bf16",
-    epilogue: str = "none",  # "none", "bias", "bias_relu", "bias_silu", "bias_gelu"
+    epilogue: str = "none",  # none/bias/activation or K3 residual_add3
     waves_per_eu: int | None = None,
     enable_scheduler: bool = True,
     use_async_copy: bool = False,
@@ -140,6 +140,9 @@ def compile_preshuffle_gemm(
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
     Signature: fn(C, out, semaphore, A, B, scale_a, scale_b, bias, M, N, stream).
+    For ``residual_add3`` C is the destination, ``bias`` is the first
+    [M,N] BF16 residual and ``out`` is the second. The epilogue preserves
+    the two BF16 rounding boundaries: bf16(GEMM + residual0) + residual1.
     For split_k > 1, C is an fp32 partial workspace and the last arriving split
     performs the reduction and final conversion inside the same kernel launch.
     """
@@ -153,9 +156,17 @@ def compile_preshuffle_gemm(
             "tile_k must be a positive divisor of K/split_k; "
             f"got tile_k={tile_k}, K={K}, split_k={split_k}"
         )
-    if epilogue not in ("none", "bias", "bias_relu", "bias_silu", "bias_gelu"):
+    if epilogue not in (
+        "none",
+        "bias",
+        "bias_relu",
+        "bias_silu",
+        "bias_gelu",
+        "residual_add3",
+    ):
         raise ValueError(
-            f"epilogue must be none/bias/bias_relu/bias_silu/bias_gelu, got {epilogue!r}"
+            "epilogue must be none/bias/bias_relu/bias_silu/bias_gelu/"
+            f"residual_add3, got {epilogue!r}"
         )
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
@@ -164,6 +175,7 @@ def compile_preshuffle_gemm(
     _has_relu = epilogue == "bias_relu"
     _has_silu = epilogue == "bias_silu"
     _has_gelu = epilogue == "bias_gelu"
+    _has_residual_add3 = epilogue == "residual_add3"
     if split_k > 1 and _has_epilogue:
         raise ValueError("split_k > 1 does not support fused bias or activation")
 
@@ -674,7 +686,7 @@ def compile_preshuffle_gemm(
             return fx.Vector(fx.memref_load_vec(r))[0]
 
         def load_epi_operands():
-            s_a = s_b = bias = None
+            s_a = s_b = bias = residual0 = residual1 = None
             if const_expr(is_8bit):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
                 sb_tiles = _epi_tiles(arg_scale_b, 1)
@@ -720,14 +732,73 @@ def compile_preshuffle_gemm(
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
-            return s_a, s_b, bias
+            if const_expr(_has_residual_add3):
+                residual_elem_ty = (
+                    fx.BFloat16 if out_dtype == "bf16" else fx.Float16
+                )
+                residual_records = (
+                    fx.Int64(i32_m)
+                    * fx.Int64(N)
+                    * fx.Int64(out_elem_bytes)
+                )
+                residual0_tiles = _epi_tiles(
+                    arg_bias,
+                    1,
+                    max_size=False,
+                    num_records_bytes=residual_records,
+                )
+                residual1_tiles = _epi_tiles(
+                    arg_out,
+                    1,
+                    max_size=False,
+                    num_records_bytes=residual_records,
+                )
+                residual_atom = fx.make_copy_atom(
+                    fx.rocdl.BufferCopy16b(0), residual_elem_ty
+                )
+                residual0 = []
+                residual1 = []
+                for p in range_constexpr(acc_size):
+                    ni = p // (m_repeat * 4)
+                    mi = (p // 4) % m_repeat
+                    ii = p % 4
+                    row = bx_m + mi * 16 + lane_div_16 * 4 + ii
+                    col = by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
+                    index = row * N + col
+                    residual0.append(
+                        fx.Float32(
+                            _epi_read1(
+                                residual0_tiles,
+                                index,
+                                residual_elem_ty,
+                                residual_atom,
+                            )
+                        )
+                    )
+                    residual1.append(
+                        fx.Float32(
+                            _epi_read1(
+                                residual1_tiles,
+                                index,
+                                residual_elem_ty,
+                                residual_atom,
+                            )
+                        )
+                    )
+            return s_a, s_b, bias, residual0, residual1
 
         overlap_epi_load = (
             acc_size <= 64
         )  # small enough accumulator to keep operands live over the MMA
-        s_a_vals = s_b_vals = bias_vals = None
+        s_a_vals = s_b_vals = bias_vals = residual0_vals = residual1_vals = None
         if const_expr(overlap_epi_load):
-            s_a_vals, s_b_vals, bias_vals = load_epi_operands()
+            (
+                s_a_vals,
+                s_b_vals,
+                bias_vals,
+                residual0_vals,
+                residual1_vals,
+            ) = load_epi_operands()
 
         # Final MMA stage — overlaps the epilogue-operand loads when issued above.
         if const_expr(lds_stage == 1):
@@ -740,7 +811,13 @@ def compile_preshuffle_gemm(
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
             if const_expr(not overlap_epi_load):
-                s_a_vals, s_b_vals, bias_vals = load_epi_operands()
+                (
+                    s_a_vals,
+                    s_b_vals,
+                    bias_vals,
+                    residual0_vals,
+                    residual1_vals,
+                ) = load_epi_operands()
 
             def apply_activation(val_s):
                 # ReLU/SiLU/GeLU : maximumf for relu; exp+rcp for silu;
@@ -780,7 +857,18 @@ def compile_preshuffle_gemm(
                 if const_expr(_has_bias):
                     val_s = val_s + bias_vals[ni]
                 val_s = apply_activation(val_s)
-                out_elems.append(val_s.to(out_elem_cls))
+                if const_expr(_has_residual_add3):
+                    # Match the unfused pair exactly: GEMM materializes BF16,
+                    # then each residual add materializes BF16 again.
+                    projected = val_s.to(out_elem_cls)
+                    added0 = (
+                        fx.Float32(projected) + residual0_vals[p]
+                    ).to(out_elem_cls)
+                    out_elems.append(
+                        (fx.Float32(added0) + residual1_vals[p]).to(out_elem_cls)
+                    )
+                else:
+                    out_elems.append(val_s.to(out_elem_cls))
 
             out_vec = fx.Vector.from_elements(out_elems, out_elem_cls)
             frag_C_out.store(out_vec)
