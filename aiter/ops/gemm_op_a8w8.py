@@ -159,6 +159,8 @@ def gemm_a8w8_bpreshuffle_flydsl(
     w_scale: Tensor,
     Out: Tensor,
     config: dict,
+    residual0: Tensor | None = None,
+    residual1: Tensor | None = None,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
     # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
@@ -198,6 +200,8 @@ def gemm_a8w8_bpreshuffle_flydsl(
         lds_stage=lds_stage,
         enable_scheduler=str(scheduler).lower() != "off",
         split_k=k_split,
+        residual0=residual0,
+        residual1=residual1,
     )
     return Out
 
@@ -794,6 +798,61 @@ def gemm_a8w8_bpreshuffle(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+def gemm_a8w8_bpreshuffle_add3(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    residual0: Tensor,
+    residual1: Tensor,
+    *,
+    out: Tensor | None = None,
+) -> Tensor | None:
+    """Run a tuned FlyDSL A8W8 GEMM with the K3 rounded residual epilogue.
+
+    Return ``None`` when the selected shape uses CK/CKTile so callers can
+    preserve the existing GEMM plus elementwise fallback.
+    """
+    m, k = XQ.shape
+    n, w_k = WQ.shape
+    if WQ.dtype != dtypes.fp8 or w_k != k:
+        return None
+    config = get_GEMM_config_with_quant_type(
+        m,
+        n,
+        k,
+        dtypes.fp8,
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    )
+    if config is None or config["libtype"] != "flydsl":
+        return None
+    parsed = _parse_flydsl_kernel_name(str(config.get("kernelName", "")))
+    if parsed is None or parsed[-1] != 1:
+        return None
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=XQ.device)
+    elif (
+        out.shape != (m, n)
+        or out.dtype != torch.bfloat16
+        or out.device != XQ.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous shape {(m, n)}, dtype bfloat16, "
+            f"device {XQ.device}"
+        )
+    return gemm_a8w8_bpreshuffle_flydsl(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        out,
+        config,
+        residual0=residual0,
+        residual1=residual1,
+    )
 
 
 def gemm_a8w8_blockscale_fake(
