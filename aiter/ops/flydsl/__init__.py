@@ -54,6 +54,14 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_fp8_paged_mqa_logits": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx950": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
+    ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -66,6 +74,14 @@ _LAZY_IMPORTS = {
     "flydsl_hstu_attention_fwd": (
         ".hstu_attention",
         "flydsl_hstu_attention_fwd",
+    ),
+    "flydsl_kda_decode": (
+        ".kda_decode",
+        "flydsl_kda_decode",
+    ),
+    "flydsl_kda_decode_with_f_b": (
+        ".kda_decode",
+        "flydsl_kda_decode_with_f_b",
     ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
@@ -103,6 +119,10 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
     ),
+    "is_flydsl_kda_decode_supported": (
+        ".kda_decode",
+        "is_flydsl_kda_decode_supported",
+    ),
 }
 
 __all__ = [
@@ -116,10 +136,14 @@ __all__ = [
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
@@ -131,6 +155,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "is_flydsl_kda_decode_supported",
     "pa_decode",
 ]
 
