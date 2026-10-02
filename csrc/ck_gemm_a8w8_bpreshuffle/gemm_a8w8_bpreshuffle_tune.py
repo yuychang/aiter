@@ -252,6 +252,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         _op.get_GEMM_config_with_quant_type.cache_clear()
         _op._GEMM_QUANT_TYPE_CACHE.clear()
         _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
+        _op._GEMM_QUANT_TYPE_MAX_M.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(

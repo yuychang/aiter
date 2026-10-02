@@ -191,11 +191,31 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
-    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX, flydsl_preshuffle_gemm_a8
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+    # The preshuffle kernel views A and C through a layout capped at
+    # PRESHUFFLE_M_MAX rows. GEMM along M is independent, so a taller problem
+    # reuses the same tile on contiguous row chunks.
+    if XQ.shape[0] > PRESHUFFLE_M_MAX:
+        if x_scale.shape[0] != XQ.shape[0]:
+            raise RuntimeError(
+                f"flydsl M-chunking needs x_scale rows == M, got {tuple(x_scale.shape)} "
+                f"for M={XQ.shape[0]}"
+            )
+        for start in range(0, XQ.shape[0], PRESHUFFLE_M_MAX):
+            end = min(start + PRESHUFFLE_M_MAX, XQ.shape[0])
+            gemm_a8w8_bpreshuffle_flydsl(
+                XQ[start:end],
+                WQ,
+                x_scale[start:end],
+                w_scale,
+                Out[start:end],
+                config,
+            )
+        return Out
     tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
 
     flydsl_preshuffle_gemm_a8(
@@ -510,6 +530,44 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
 
 _GEMM_QUANT_TYPE_CACHE: dict = {}
 _GEMM_QUANT_TYPE_HAS_GFX: dict = {}
+# shape (everything but M) -> (largest tuned M, that row). Built once per CSV.
+_GEMM_QUANT_TYPE_MAX_M: dict = {}
+
+
+def _index_largest_tuned_m(cache: dict, has_gfx: bool) -> dict:
+    """Map each shape except M to ``(largest tuned M, that row)``.
+
+    FlyDSL names encode a tile and the launch uses the real M, so the row at
+    the top of the table stays valid for every larger M. A miss below that M
+    keeps the default kernel instead of a tile chosen for a much bigger problem.
+    """
+    best: dict = {}
+    for key, config in cache.items():
+        if has_gfx:
+            _gfx, _cu_num, m, n, k, q = key
+            shape = (_gfx, _cu_num, n, k, q)
+        else:
+            _cu_num, m, n, k, q = key
+            shape = (_cu_num, n, k, q)
+        prev = best.get(shape)
+        if prev is None or m > prev[0]:
+            best[shape] = (m, config)
+    return best
+
+
+def _gemm_quant_shape_key(has_gfx, gfx, cu_num, n, k, q_dtype_w):
+    q = str(q_dtype_w)
+    if has_gfx:
+        return (gfx, cu_num, n, k, q)
+    return (cu_num, n, k, q)
+
+
+def _config_for_m_above_table(max_m_index, has_gfx, gfx, cu_num, m, n, k, q_dtype_w):
+    """The largest tuned row when ``m`` is above the table, else None."""
+    entry = max_m_index.get(_gemm_quant_shape_key(has_gfx, gfx, cu_num, n, k, q_dtype_w))
+    if entry is None or m <= entry[0]:
+        return None
+    return entry[1]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -541,6 +599,15 @@ def get_GEMM_config_with_quant_type(
                 ["cu_num", "M", "N", "K", "q_dtype_w"]
             ).to_dict("index")
             _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = False
+        _GEMM_QUANT_TYPE_MAX_M[tuned_file] = _index_largest_tuned_m(
+            _GEMM_QUANT_TYPE_CACHE[tuned_file],
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file],
+        )
+    elif tuned_file not in _GEMM_QUANT_TYPE_MAX_M:
+        _GEMM_QUANT_TYPE_MAX_M[tuned_file] = _index_largest_tuned_m(
+            _GEMM_QUANT_TYPE_CACHE[tuned_file],
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file],
+        )
 
     gfx = get_gfx()
     cu_num = get_cu_num()
@@ -565,9 +632,29 @@ def get_GEMM_config_with_quant_type(
                 logger.info(msg)
             break
     if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+        config = _config_for_m_above_table(
+            _GEMM_QUANT_TYPE_MAX_M[tuned_file],
+            has_gfx,
+            gfx,
+            cu_num,
+            M,
+            N,
+            K,
+            q_dtype_w,
         )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                tuned_m = _GEMM_QUANT_TYPE_MAX_M[tuned_file][
+                    _gemm_quant_shape_key(has_gfx, gfx, cu_num, N, K, q_dtype_w)
+                ][0]
+                logger.info(
+                    f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, above tuned "
+                    f"M:{tuned_m}; reusing {config.get('kernelName')} from {tuned_file}"
+                )
+        else:
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+            )
     return config
 
 
