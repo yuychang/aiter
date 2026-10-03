@@ -104,7 +104,6 @@ def _mla_gluon(
     REGIME: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     QLEN: gl.constexpr,  # MTP query length; 1 for plain decode
-    Q_PACK: gl.constexpr,  # query positions sharing one KV traversal
     # --- dsv4-prefill knobs ---
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
@@ -119,19 +118,17 @@ def _mla_gluon(
         cur_batch = gl.program_id(0) + (gl.program_id(2) // NUM_KV_SPLITS) * NUM_XCDS
         cur_head_id = gl.program_id(1) % NUM_M_BLOCKS
         q_pos = gl.program_id(1) // NUM_M_BLOCKS
-        q_group = q_pos
         split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
     else:
         # bh16*: grid axis 2 carries (head_block, q_pos). For nhead <= 16 there is
         # a single head block (NUM_M_BLOCKS==1) so cur_head_id==0 and q_pos==pid(2),
         # identical to the original 2-D+qlen mapping. For nhead > 16 (e.g. 96) the
         # head range is tiled into NUM_M_BLOCKS = cdiv(NHEAD, BLOCK_H) blocks of 16.
-        HEADS_PER_Q: gl.constexpr = BLOCK_H // Q_PACK
-        NUM_M_BLOCKS: gl.constexpr = (NHEAD + HEADS_PER_Q - 1) // HEADS_PER_Q
+        NUM_M_BLOCKS: gl.constexpr = (NHEAD + BLOCK_H - 1) // BLOCK_H
         cur_batch = gl.program_id(0)
         split_kv_id = gl.program_id(1)
         cur_head_id = gl.program_id(2) % NUM_M_BLOCKS
-        q_group = gl.program_id(2) // NUM_M_BLOCKS
+        q_pos = gl.program_id(2) // NUM_M_BLOCKS
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -165,6 +162,15 @@ def _mla_gluon(
         stride_kv_c_bs = stride_kv_c_bs.to(gl.int64)
         stride_k_pe_bs = stride_k_pe_bs.to(gl.int64)
 
+    # MTP causal tail mask: query position q_pos may attend KV
+    # [0, seq_len-QLEN+q_pos] only, so score_end is its per-program valid-score
+    # bound. For QLEN==1 this equals split_kv_end, keeping the original code
+    # path untouched.
+    if QLEN > 1:
+        score_end = gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + q_pos + 1)
+    else:
+        score_end = split_kv_end
+
     ######### layout setting begin #########
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
     # bh64 has BLOCK_H=64; bh16bn128 and bh16bn64 share BLOCK_H=16 (identical Q layouts + mfma orientation).
@@ -194,38 +200,6 @@ def _mla_gluon(
             offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
             cga_layout=[],
             shape=[64, 64]
-        )
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=[16, 16, 32],
-            transposed=True,
-            warps_per_cta=[4, 1],
-        )
-    elif BLOCK_H == 32:
-        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8],
-            threads_per_warp=[1, 64],
-            warps_per_cta=[4, 1],
-            order=[1, 0],
-        )
-        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
-            cga_layout=[],
-            shape=[32, 512]
-        )
-        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4)),
-            lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
-            warp_bases=((1, 0), (2, 0)),
-            block_bases=[],
-            shape=[32, 64],
-        )
-        shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0]],
-            cga_layout=[],
-            shape=[32, 64]
         )
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
@@ -389,46 +363,19 @@ def _mla_gluon(
 
     # load q_nope
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
-    q_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
-    if Q_PACK > 1:
-        cur_head = cur_head_id * (BLOCK_H // Q_PACK) + q_row % (BLOCK_H // Q_PACK)
-        q_pos = q_group * Q_PACK + q_row // (BLOCK_H // Q_PACK)
-        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos[:, None] * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-        q_mask = ((cur_head < NHEAD) & (q_pos < QLEN))[:, None]
-    else:
-        cur_head = cur_head_id * BLOCK_H + q_row
-        q_pos = q_group
-        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-        q_mask = (cur_head < NHEAD)[:, None]
+    cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
+    offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
     ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask=q_mask)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
     if HAS_PE:
         offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
-        qpe_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
-        if Q_PACK > 1:
-            cur_head_qpe = cur_head_id * (BLOCK_H // Q_PACK) + qpe_row % (BLOCK_H // Q_PACK)
-            q_pos_qpe = q_group * Q_PACK + qpe_row // (BLOCK_H // Q_PACK)
-            offs_q_pe = cur_batch * stride_q_pe_bs + q_pos_qpe[:, None] * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-            qpe_mask = ((cur_head_qpe < NHEAD) & (q_pos_qpe < QLEN))[:, None]
-        else:
-            cur_head_qpe = cur_head_id * BLOCK_H + qpe_row
-            q_pos_qpe = q_group
-            offs_q_pe = cur_batch * stride_q_pe_bs + q_pos_qpe * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-            qpe_mask = (cur_head_qpe < NHEAD)[:, None]
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask=qpe_mask)
+        cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
+        offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
         gl.amd.cdna4.async_copy.commit_group()
-
-    score_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
-    if Q_PACK > 1:
-        score_q_pos = q_group * Q_PACK + score_row // (BLOCK_H // Q_PACK)
-    else:
-        score_q_pos = q_group
-    score_end = gl.minimum(
-        split_kv_end, cur_batch_seq_len - QLEN + score_q_pos + 1
-    ) if QLEN > 1 else split_kv_end
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
@@ -721,20 +668,9 @@ def _mla_gluon(
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
-    out_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
-    if Q_PACK > 1:
-        cur_head_o = cur_head_id * (BLOCK_H // Q_PACK) + out_row % (BLOCK_H // Q_PACK)
-        q_pos_o = q_group * Q_PACK + out_row // (BLOCK_H // Q_PACK)
-    else:
-        cur_head_o = cur_head_id * BLOCK_H + out_row
-        q_pos_o = q_group
+    cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
-    if Q_PACK > 1:
-        offs_o = cur_batch * stride_o_b + q_pos_o[:, None] * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
-        out_mask = ((cur_head_o < NHEAD) & (q_pos_o < QLEN))[:, None]
-    else:
-        offs_o = cur_batch * stride_o_b + q_pos_o * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
-        out_mask = (cur_head_o < NHEAD)[:, None]
+    offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
 
     if HAS_ATTN_SINK:
         # Fold the optional per-head sink into the softmax denom (no V contribution).
@@ -752,31 +688,32 @@ def _mla_gluon(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-    gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=out_mask)
+    if NHEAD % BLOCK_H != 0:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
+    else:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
 
     ### store lse
     blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
-    lse_row = gl.arange(0, BLOCK_H, layout=blocked_lse)
-    if Q_PACK > 1:
-        cur_head_lse = cur_head_id * (BLOCK_H // Q_PACK) + lse_row % (BLOCK_H // Q_PACK)
-        q_pos_lse = q_group * Q_PACK + lse_row // (BLOCK_H // Q_PACK)
-        lse_mask = (cur_head_lse < NHEAD) & (q_pos_lse < QLEN)
-    else:
-        cur_head_lse = cur_head_id * BLOCK_H + lse_row
-        q_pos_lse = q_group
-        lse_mask = cur_head_lse < NHEAD
+    cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
     if RETURN_LSE and NUM_KV_SPLITS == 1:
         # split==1: single split is the whole sequence, so its lse is the final lse.
-        offs_final_lse = cur_batch * stride_final_lse_b + q_pos_lse * stride_final_lse_s + cur_head_lse * stride_final_lse_h
+        offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=lse_mask)
+        if NHEAD % BLOCK_H != 0:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
+        else:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
-        offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos_lse * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+        offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=lse_mask)
+        if NHEAD % BLOCK_H != 0:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
+        else:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 # fmt: on
 
 
@@ -1008,15 +945,7 @@ def mla_gluon(
             kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
         ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
     else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
-        # Kimi-K3 TP8 qlen-8 verify has 12 heads. Pair two query positions in
-        # one 32-row MFMA tile so each long KV split is loaded four times
-        # instead of eight. Other shapes retain the original one-position tile.
-        Q_PACK = (
-            2
-            if REGIME == "bh16bn128" and nhead <= 16 and qlen == 8
-            else 1
-        )
-        BLOCK_H = 16 * Q_PACK
+        BLOCK_H = 16
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
@@ -1024,10 +953,8 @@ def mla_gluon(
         # Graph capture cannot freeze it; the kernels derive the per-batch
         # partition from the runtime KV length. Head blocks and MTP qlen already
         # consume part of the wave, so the budget divides by them too.
-        HEADS_PER_Q = BLOCK_H // Q_PACK
-        NUM_M_BLOCKS = triton.cdiv(nhead, HEADS_PER_Q)
-        Q_GROUPS = triton.cdiv(qlen, Q_PACK)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * Q_GROUPS * NUM_M_BLOCKS))
+        NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
+        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -1101,8 +1028,6 @@ def mla_gluon(
         stride_final_lse_b, stride_final_lse_s, stride_final_lse_h = 0, 0, 0
 
     if REGIME == "bh64":
-        Q_PACK = 1
-        Q_GROUPS = qlen
         grid = (
             NUM_XCDS,
             triton.cdiv(nhead, BLOCK_H) * qlen,
@@ -1112,7 +1037,7 @@ def mla_gluon(
         # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
         # times qlen query positions. For nhead <= 16 this is just qlen (one head
         # block), i.e. the original grid-axis MTP mapping.
-        grid = (batch_size, NUM_KV_SPLITS, NUM_M_BLOCKS * Q_GROUPS)
+        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_gluon[grid](
@@ -1162,7 +1087,6 @@ def mla_gluon(
         REGIME=REGIME,
         RETURN_LSE=return_lse,
         QLEN=qlen,
-        Q_PACK=Q_PACK,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
     )
