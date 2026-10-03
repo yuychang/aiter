@@ -1036,7 +1036,10 @@ def mla_gluon(
         HEADS_PER_Q = BLOCK_H // Q_PACK
         NUM_M_BLOCKS = triton.cdiv(nhead, HEADS_PER_Q)
         Q_GROUPS = triton.cdiv(qlen, Q_PACK)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * Q_GROUPS * NUM_M_BLOCKS))
+        # Keep the established split count. Packed programs carry twice the
+        # query work and need fewer resident workgroups; doubling splits only
+        # adds stage-2 traffic and register-heavy CTAs.
+        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
