@@ -906,7 +906,10 @@ def mla_gluon(
         if kv_c.dtype == torch.bfloat16:
             REGIME = "bh16bn64"
         elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
-            REGIME = "bh16bn128"
+            # Long qlen-8 verify is latency-bound with the 128-wide tile's LDS
+            # footprint. A 64-wide tile permits more resident workgroups while
+            # keeping the same query/head mapping and causal math.
+            REGIME = "bh16bn64fp8" if qlen == 8 else "bh16bn128"
         else:
             raise AssertionError(
                 f"mla_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_c.dtype}"
@@ -947,7 +950,11 @@ def mla_gluon(
     else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
         BLOCK_H = 16
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
-        kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
+        kv_dtype = (
+            torch.float8_e4m3fn
+            if REGIME in ("bh16bn128", "bh16bn64fp8")
+            else torch.bfloat16
+        )
         NUM_XCDS = 1  # unused by 2-D split grid mapping
         # Fixed ~256-WG launch budget, independent of sequence length so CUDA
         # Graph capture cannot freeze it; the kernels derive the per-batch
