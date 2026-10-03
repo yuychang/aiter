@@ -596,7 +596,10 @@ def _mla_gluon(
         #### dot, softmax, dot (part1)
         qk *= qk_scale
         offs_n_qk = split_kv_start + i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        if Q_PACK > 1:
+            qk = gl.where(offs_n_qk[None, :] < score_end[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         LOG2E: gl.constexpr = 1.4426950408889634
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
@@ -670,7 +673,10 @@ def _mla_gluon(
             qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
         qk *= qk_scale
         offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        if Q_PACK > 1:
+            qk = gl.where(offs_n_qk[None, :] < score_end[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
         p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
@@ -703,7 +709,10 @@ def _mla_gluon(
         qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
     qk *= qk_scale
     offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-    qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+    if Q_PACK > 1:
+        qk = gl.where(offs_n_qk[None, :] < score_end[:, None], qk, float("-inf"))
+    else:
+        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
     re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
     p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
