@@ -280,47 +280,6 @@ def _mla_gluon(
             block_bases=[],
             shape=[512, 64],
         )
-    elif REGIME == 'bh16bn64fp8':
-        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32)),
-            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[512, 64],
-        )
-        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[1024, 32], [8192, 16]],
-            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 16], [0, 1], [0, 2], [0, 8], [0, 4], [0, 32]],
-            cga_layout=[],
-            shape=[512, 64]
-        )
-        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
-            lane_bases=((16, 0), (32, 0), (0, 4), (0, 8), (0, 16), (0, 32)),
-            warp_bases=((0, 1), (0, 0)),
-            block_bases=[],
-            shape=[64, 64],
-        )
-        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[2048, 16]],
-            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 1], [0, 2]],
-            cga_layout=[],
-            shape=[64, 64]
-        )
-        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0,),),
-            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
-            warp_bases=((0,), (0,)),
-            block_bases=[],
-            shape=[64],
-        )
-        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4)),
-            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[512, 32],
-        )
     else:
         # BLOCK_N == 64: shared by bh64 and bh16bn64 (both bf16 KV).
         # K is [512, 64]bf16, KPE is [64, 64]bf16.
@@ -382,14 +341,6 @@ def _mla_gluon(
             warp_bases=((16, 0), (32, 0)),
             block_bases=[],
             shape=[512, 128],
-        )
-    elif REGIME == 'bh16bn64fp8':
-        linear_v: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (64, 0), (128, 0), (256, 0)),
-            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-            warp_bases=((16, 0), (32, 0)),
-            block_bases=[],
-            shape=[512, 64],
         )
     else:
         linear_v: gl.constexpr = gl.DistributedLinearLayout(
