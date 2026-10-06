@@ -825,13 +825,14 @@ def bh16_num_kv_splits(batch_size, qlen, num_m_blocks):
     already consume part of that wave.
 
     qlen >= 8 (DSpark block 7 verifies 8 tokens) re-reads KV once per query
-    position. Dividing the budget by batch_size then drops a 3-wide step from
-    32 splits to 10, and the long-context tail of that step slows down. Keep
-    the single-request split count for that verify length. qlen 4 (block 3)
-    stays on the shared budget.
+    position. Dividing the budget by batch_size drops a 3-wide step from 32
+    splits to 10, and a long-context microbenchmark improves from 935 to 886
+    us when it keeps 32. The same floor regresses the 2-wide and 4-wide shapes,
+    so specialize only the 3-wide tail that sets AgentX c4 P90. qlen 4 (block
+    3) stays on the shared budget.
     """
     per_step = max(1, 256 // (batch_size * qlen * num_m_blocks))
-    if qlen >= 8:
+    if qlen >= 8 and batch_size == 3:
         per_step = max(per_step, max(1, 256 // (qlen * num_m_blocks)))
     return per_step
 
