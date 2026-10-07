@@ -59,7 +59,8 @@ void gated_rmsnorm_fp8_group_quant(
  *   z: Gating tensor [num_tokens, num_heads, head_dim] (bf16/fp16)
  *   weight: RMSNorm weight [head_dim] (bf16/fp16)
  *   epsilon: Small value for numerical stability
- *   use_sigmoid: If true, use sigmoid(z) instead of silu(z)
+ *   use_sigmoid: If true, use sigmoid(z) instead of silu(z) and round
+ *     through the input dtype before quantization to match KDA's split path.
  */
 void gated_rmsnorm_fp8_per_token_quant(
     aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
