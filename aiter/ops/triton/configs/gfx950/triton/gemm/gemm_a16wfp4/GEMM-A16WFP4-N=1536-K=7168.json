@@ -80,7 +80,7 @@
         "num_stages": 1,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "cache_modifier": null,
+        "cache_modifier": ".cg",
         "NUM_KSPLIT": 1
     }
 }
