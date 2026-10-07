@@ -433,6 +433,9 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
             float sigmoid_z = 1.0f / (1.0f + expf(-z_vals[i]));
             if constexpr (USE_SIGMOID) {
                 gated_vals[i] = normed * sigmoid_z;
+                // Match KDA's split path: round through the input dtype
+                // before the per-token amax and the FP8 cast.
+                gated_vals[i] = opus::cast<float>(opus::cast<DTYPE_I>(gated_vals[i]));
             } else {
                 float silu_z = z_vals[i] * sigmoid_z;
                 gated_vals[i] = normed * silu_z;

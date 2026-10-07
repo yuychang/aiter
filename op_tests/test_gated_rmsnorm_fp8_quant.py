@@ -364,7 +364,8 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     normed = normed * weight.float().view(1, 1, -1)
 
     if use_sigmoid:
-        gated = normed * torch.sigmoid(z.float())
+        # KDA's gate, including the round through x's dtype the kernel keeps.
+        gated = (normed * torch.sigmoid(z.float())).to(x.dtype).float()
     else:
         gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
     flat = gated.reshape(num_tokens, -1)  # [num_tokens, num_heads*head_dim]
