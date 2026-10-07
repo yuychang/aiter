@@ -3875,6 +3875,9 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
