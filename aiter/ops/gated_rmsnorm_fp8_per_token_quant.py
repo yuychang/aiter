@@ -46,7 +46,8 @@ def gated_rmsnorm_fp8_per_token_quant(
         z: [num_tokens, num_heads, head_dim] gating tensor (bf16/fp16)
         weight: [head_dim] RMSNorm weight (bf16/fp16)
         epsilon: numerical stability epsilon
-        use_sigmoid: If true, use sigmoid(z) instead of silu(z)
+        use_sigmoid: If true, use sigmoid(z) instead of silu(z) and round
+            through x's dtype before quantization to match KDA's split path.
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """

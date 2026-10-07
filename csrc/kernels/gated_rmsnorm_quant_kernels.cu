@@ -339,6 +339,8 @@ void gated_rmsnorm_fp8_group_quant(
  * Constraints:
  * - ONLY supports head_dim=128 (RMSNorm group) and num_heads <= 128.
  * - AMD GPU: warp_size=64.
+ *
+ * USE_SIGMOID also rounds through DTYPE_I to match KDA's split path.
  */
 template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, bool USE_SIGMOID = false>
 __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
@@ -433,6 +435,8 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
             float sigmoid_z = 1.0f / (1.0f + expf(-z_vals[i]));
             if constexpr (USE_SIGMOID) {
                 gated_vals[i] = normed * sigmoid_z;
+                // Keep KDA's rounding boundary without its intermediate store.
+                gated_vals[i] = opus::cast<float>(opus::cast<DTYPE_I>(gated_vals[i]));
             } else {
                 float silu_z = z_vals[i] * sigmoid_z;
                 gated_vals[i] = normed * silu_z;
