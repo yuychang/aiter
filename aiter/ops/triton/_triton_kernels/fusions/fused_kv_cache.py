@@ -106,7 +106,6 @@ def _store_kv_cache_kernel(
             v_scales.to(e4m3_dtype).to(value_cache_ptr.dtype.element_ty, bitcast=True),
         )
     else:
-
         if FLASH_LAYOUT:
             k_out_ptrs = (
                 key_cache_ptr
@@ -316,6 +315,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     kv_cache_stride_h,
     kv_cache_stride_d,
     k_scale_ptr,
+    q_scale_ptr,
     QH_PER_KH: tl.constexpr,
     QH: tl.constexpr,
     KH: tl.constexpr,
@@ -330,8 +330,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
+    HAVE_Q_SCALE: tl.constexpr = False,
     UPCAST_OPERAND: tl.constexpr = False,
     APPLY_ROPE: tl.constexpr = True,
+    SANITIZE_INVALID_Q_POS: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -364,6 +366,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 d_cos_offs = d_pe_offs
 
             pos = tl.load(pos_ptr + pid_b * pos_stride_b)
+            if SANITIZE_INVALID_Q_POS:
+                # Rows with slot -1 can carry garbage positions; read cos/sin at 0.
+                q_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
+                pos = tl.where(q_slot >= 0, pos, 0)
             cos_offs = pos * cos_stride_b + d_cos_offs * cos_stride_d
             cos = tl.load(cos_ptr + cos_offs)
             sin = tl.load(sin_ptr + cos_offs)
@@ -397,6 +403,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             )
         else:
             q_pe = tl.load(q_pe_ptrs)
+        if HAVE_Q_SCALE:
+            q_scale_rcprl = (1.0 / tl.load(q_scale_ptr)).to(tl.float32)
+            q_nope = q_nope.to(tl.float32) * q_scale_rcprl
+            q_pe = q_pe.to(tl.float32) * q_scale_rcprl
         tl.store(
             q_out_ptrs + d_nope_offs * q_out_stride_d,
             q_nope.to(q_out_ptr.dtype.element_ty),

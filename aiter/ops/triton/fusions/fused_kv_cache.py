@@ -64,6 +64,9 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    q_scale: torch.Tensor = None,
+    compute_all_q_rope: bool = True,
+    identity_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -124,6 +127,9 @@ def fused_qk_rope_cat_and_cache_mla(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    q_scale: torch.Tensor = None,
+    compute_all_q_rope: bool = True,
+    identity_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -150,6 +156,12 @@ def fused_qk_rope_cat_and_cache_mla(
       gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
       full path.
 
+    - q_scale: Optional single-element tensor. When set, q_out holds q / q_scale.
+    - compute_all_q_rope: When False, q rows whose slot is -1 use position 0, so
+      a padded or invalid position never indexes cos/sin out of range.
+    - identity_rope: When True, pos/cos/sin are ignored and the PE halves are
+      copied through unrotated, as in fused_qk_cat_and_cache_mla.
+
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
 
     Returns (kv_cache is written in place for every slot >= 0 and not returned):
@@ -170,6 +182,8 @@ def fused_qk_rope_cat_and_cache_mla(
         tuple(kv_cache.shape),
         tuple(slot_mapping.shape),
     )
+    if identity_rope:
+        pos = cos = sin = None
     return _cat_and_cache_mla(
         q_nope,
         q_pe,
@@ -191,6 +205,8 @@ def fused_qk_rope_cat_and_cache_mla(
         shuffled_kv_cache,
         upcast_operand,
         q_nope_prestored,
+        q_scale,
+        not compute_all_q_rope,
     )
 
 
@@ -320,6 +336,8 @@ def _cat_and_cache_mla(
     shuffled_kv_cache: bool,
     upcast_operand: bool,
     q_nope_prestored: bool = False,
+    q_scale: torch.Tensor | None = None,
+    sanitize_invalid_q_pos: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Shared launch for both entry points; pos=cos=sin=None is the NoPE form."""
     apply_rope = cos is not None
@@ -387,6 +405,9 @@ def _cat_and_cache_mla(
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
+    assert DEVICE_ARCH != "gfx1250" or (
+        q_scale is None and not sanitize_invalid_q_pos
+    ), "q_scale and compute_all_q_rope=False have no gfx1250 kernel"
     assert not (q_nope_prestored and q_out is None), (
         "q_nope_prestored requires a q_out that already holds q_nope in "
         "q_out[..., :d_nope]"
@@ -508,8 +529,14 @@ def _cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        q_kwargs = {}
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        q_kwargs = {
+            "q_scale_ptr": q_scale,
+            "HAVE_Q_SCALE": q_scale is not None,
+            "SANITIZE_INVALID_Q_POS": sanitize_invalid_q_pos and apply_rope,
+        }
 
     # The kernel never dereferences these when APPLY_ROPE is False.
     pos_stride_b = pos.stride(0) if apply_rope else 0
@@ -564,6 +591,7 @@ def _cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         APPLY_ROPE=apply_rope,
+        **q_kwargs,
         num_warps=1,
     )
 
