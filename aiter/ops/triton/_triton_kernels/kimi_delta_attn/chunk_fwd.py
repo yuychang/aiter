@@ -72,6 +72,8 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_chunk: torch.Tensor | None = None,
+    snapshot_state: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -109,7 +111,10 @@ def chunk_delta_attn_fwd(
                             same name.
         out:                Optional contiguous output buffer, same shape as
                             ``v``. FlashKDA-only, like ``state_cache``.
-        state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
+        state_cache:        Optional paged fp32 or bf16 V-first cache. FlashKDA-only.
+        snapshot_chunk:     Optional int32 ``[N]`` flash-chunk index whose incoming
+                            state is written to ``snapshot_state``. FlashKDA-only.
+        snapshot_state:     Optional fp32 ``[N, H, V, K]`` snapshot buffer.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -168,6 +173,10 @@ def chunk_delta_attn_fwd(
             "out is only implemented on the FlashKDA path; use the returned "
             "tensor, or pass a call that flash_kda_supported accepts"
         )
+    if snapshot_chunk is not None and not use_flash_kda:
+        raise ValueError(
+            "snapshot_chunk is only implemented on the FlashKDA path"
+        )
 
     if use_flash_kda:
         o, final_state = flash_kda_fwd(
@@ -189,6 +198,8 @@ def chunk_delta_attn_fwd(
             state_cache=state_cache,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
+            snapshot_chunk=snapshot_chunk,
+            snapshot_state=snapshot_state,
         )
         return o, final_state, None, None, None, None, None, None, None
 

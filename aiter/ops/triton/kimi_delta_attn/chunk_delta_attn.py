@@ -65,6 +65,8 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_chunk: torch.Tensor | None = None,
+    snapshot_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -150,9 +152,10 @@ def chunk_kimi_delta_attn(
             `state_cache`. FlashKDA-only; the default pipeline rejects this
             argument rather than ignoring it.
         state_cache (torch.Tensor, optional):
-            Paged fp32 V-first cache `[slots, H, V, K]`. Replaces
+            Paged fp32 or bf16 V-first cache `[slots, H, V, K]`. Replaces
             `initial_state`: sequence `n` is row `state_indices[n]`. Each
             slot's `[H, V, K]` plane must be dense; `stride(0)` may be padded.
+            Loads widen to fp32 and stores match the cache dtype.
             FlashKDA-only; the default pipeline rejects this argument rather
             than ignoring it.
         state_indices (torch.Tensor, optional):
@@ -302,5 +305,7 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        snapshot_chunk=snapshot_chunk,
+        snapshot_state=snapshot_state,
     )
     return o.to(q.dtype), final_state

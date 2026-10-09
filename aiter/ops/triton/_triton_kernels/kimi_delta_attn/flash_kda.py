@@ -46,6 +46,8 @@ Restrictions (the caller is expected to check these and fall back):
     * Forward only, and no intermediates for a backward pass.
     * Paged ``state_cache`` is FlashKDA-only, V-first, and is not packed:
       each slot is dense ``[H, V, K]`` while ``stride(0)`` may be padded.
+      The pool may be fp32 or bf16; loads widen to fp32 and stores match
+      the pool dtype.
 """
 
 import functools
@@ -407,6 +409,7 @@ def _seg_occupancy_class(num_segs: int) -> int:
         "PAGED_H_IN": lambda args: (
             args["state_cache"] is not None and args["h_in"] is None
         ),
+        "SNAPSHOT": lambda args: args["snapshot_chunk"] is not None,
     }
 )
 @triton.jit
@@ -428,6 +431,7 @@ def _flash_kda_segment_kernel(
     seg_tok_end,
     seg_seq,
     seg_is_last,
+    seg_local_c0,
     TOTAL_TILES,
     NUM_SEGS_CLASS,  # tuning discriminator only; see _seg_occupancy_class
     H: tl.constexpr,
@@ -448,8 +452,11 @@ def _flash_kda_segment_kernel(
     state_indices=None,
     has_initial_state=None,
     cache_stride=0,
+    snapshot_chunk=None,
+    snapshot_state=None,
     PAGED_CACHE: tl.constexpr = False,
     PAGED_H_IN: tl.constexpr = False,
+    SNAPSHOT: tl.constexpr = False,
 ):
     """Delta-rule recurrence over one segment of chunks.
 
@@ -515,7 +522,31 @@ def _flash_kda_segment_kernel(
         b_h1 = tl.zeros([64, BW], dtype=tl.float32)
         b_h2 = tl.zeros([64, BW], dtype=tl.float32)
 
+    # Incoming state of flash chunk ``want`` matches the Triton 64-token grid:
+    # the caller passes ``track_chunk_idx * 2``. Stored before the chunk update.
+    if SNAPSHOT:
+        seg_local0 = tl.load(seg_local_c0 + i_seg).to(tl.int32)
+        snap_seq = tl.load(seg_seq + i_seg).to(tl.int64)
+        want = tl.load(snapshot_chunk + snap_seq).to(tl.int32)
+    else:
+        seg_local0 = 0
+        snap_seq = 0
+        want = -1
+
     for j in range(n_chunks):
+        if SNAPSHOT:
+            if seg_local0 + j == want:
+                snap_off = (snap_seq * H + i_h) * V * K + o_w[None, :] * K
+                tl.store(
+                    snapshot_state + snap_off + o_k1[:, None],
+                    b_h1,
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    snapshot_state + snap_off + o_k2[:, None],
+                    b_h2,
+                    mask=m_w[None, :],
+                )
         ws_idx = i_h * TOTAL_TILES + chunk_base + j
         ck = ws_idx * C * K
         t0 = tok_base + j * C
@@ -584,8 +615,8 @@ def _flash_kda_segment_kernel(
     if STORE_FINAL:  # noqa: SIM102
         if tl.load(seg_is_last + i_seg) == 1:
             i_n = tl.load(seg_seq + i_seg).to(tl.int64)
-            dt_s = tl.float32 if PAGED_CACHE else final_state.dtype.element_ty
             if PAGED_CACHE:
+                dt_s = state_cache.dtype.element_ty
                 slot = tl.load(state_indices + i_n).to(tl.int64)
                 f_off = slot * cache_stride + i_h * V * K + o_w[None, :] * K
                 tl.store(
@@ -599,6 +630,7 @@ def _flash_kda_segment_kernel(
                     mask=m_w[None, :],
                 )
             elif STATE_V_FIRST:
+                dt_s = final_state.dtype.element_ty
                 f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
                 tl.store(
                     final_state + f_off + o_k1[:, None],
@@ -611,6 +643,7 @@ def _flash_kda_segment_kernel(
                     mask=m_w[None, :],
                 )
             else:
+                dt_s = final_state.dtype.element_ty
                 f_off = (i_n * H + i_h) * K * V + o_w[None, :]
                 tl.store(
                     final_state + f_off + o_k1[:, None] * V,
@@ -887,15 +920,24 @@ def _build_segments(
     """Descriptors for the segmented recurrence.
 
     Returns ``(desc, seq_seg_off, num_segs, max_segs_per_seq)`` where ``desc`` is
-    a ``[6, num_segs]`` int32 tensor holding, per segment: the global chunk index
+    a ``[7, num_segs]`` int32 tensor holding, per segment: the global chunk index
     it starts at (indexing the K1 workspace), its chunk count, its first and
-    one-past-last token, its sequence, and whether it ends that sequence.
+    one-past-last token, its sequence, whether it ends that sequence, and the
+    sequence-local flash-chunk index it starts at.
 
     Cached on the sequence bounds: building these costs a Python loop and a host
     to device copy, which at this kernel's runtime is not noise, and a serving
     loop repeats the same shapes.
     """
-    chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
+    chunk_base, nchunks, tok_base, tok_end, seq_id, is_last, local_c0 = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     seq_seg_off = [0]
     g_chunk = 0
     for i, (bos, eos) in enumerate(seqs):
@@ -910,11 +952,12 @@ def _build_segments(
             tok_end.append(min(bos + (c0 + m) * C, eos))
             seq_id.append(i)
             is_last.append(1 if s == nseg - 1 else 0)
+            local_c0.append(c0)
         seq_seg_off.append(len(chunk_base))
         g_chunk += nch
 
     desc = torch.tensor(
-        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
+        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last, local_c0],
         dtype=torch.int32,
         device=device,
     )
@@ -941,8 +984,8 @@ def _check_paged_state_cache(
     K: int,
 ) -> None:
     """Paged layout: each slot is dense ``[H, V, K]``; ``stride(0)`` may pad."""
-    if state_cache.dtype != torch.float32 or state_cache.dim() != 4:
-        raise ValueError("state_cache must be an fp32 [slots, H, V, K] tensor")
+    if state_cache.dtype not in (torch.float32, torch.bfloat16) or state_cache.dim() != 4:
+        raise ValueError("state_cache must be an fp32 or bf16 [slots, H, V, K] tensor")
     if tuple(state_cache.shape[1:]) != (H, V, K):
         raise ValueError(
             f"state_cache slot shape {tuple(state_cache.shape[1:])} != {(H, V, K)}"
@@ -984,6 +1027,8 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_chunk: torch.Tensor | None = None,
+    snapshot_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1010,10 +1055,11 @@ def flash_kda_fwd(
         out:                Optional output buffer, same shape as ``v``, and
                             contiguous: it is written in place rather than
                             packed by ``input_guard``.
-        state_cache:        Optional paged fp32 V-first cache ``[slots, H, V, K]``.
+        state_cache:        Optional paged fp32 or bf16 V-first cache ``[slots, H, V, K]``.
                             Each slot's ``[H, V, K]`` plane must be dense;
                             ``stride(0)`` may be padded. This tensor is not
-                            packed by ``input_guard``.
+                            packed by ``input_guard``. Loads widen to fp32;
+                            stores use the cache dtype.
                             When set, the walk reads sequence ``n`` from row
                             ``state_indices[n]`` if ``has_initial_state[n]`` and
                             writes the final state back to the same row.
@@ -1021,6 +1067,11 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        snapshot_chunk:     Optional int32 ``[N]``. For each sequence, the flash
+                            chunk (size 32) whose incoming state is written to
+                            ``snapshot_state``. ``-1`` skips that sequence. This
+                            is the Triton 64-token track index times 2.
+        snapshot_state:     Optional fp32 ``[N, H, V, K]`` buffer for that state.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1180,7 +1231,15 @@ def flash_kda_fwd(
     desc, seq_seg_off, num_segs, max_segs = _build_segments(
         seqs, C, chunks_per_seg, dev
     )
-    seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
+    (
+        seg_chunk_base,
+        seg_nchunks,
+        seg_tok_base,
+        seg_tok_end,
+        seg_seq,
+        seg_is_last,
+        seg_local_c0,
+    ) = desc
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
     # once here instead of carrying the layout through three passes.
@@ -1213,6 +1272,7 @@ def flash_kda_fwd(
         "seg_tok_end": seg_tok_end,
         "seg_seq": seg_seq,
         "seg_is_last": seg_is_last,
+        "seg_local_c0": seg_local_c0,
         "TOTAL_TILES": total_tiles,
         "NUM_SEGS_CLASS": _seg_occupancy_class(num_segs),
         "H": H,
@@ -1240,6 +1300,8 @@ def flash_kda_fwd(
             "state_indices": None,
             "has_initial_state": None,
             "cache_stride": 0,
+            "snapshot_chunk": None,
+            "snapshot_state": None,
             **kw,
         }
         return _segment_fast[
@@ -1319,6 +1381,26 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
+    # The snapshot is the state entering a flash chunk, so it belongs on this
+    # pass only. Pass A walks a basis, not the sequence's real state.
+    snap_args = {}
+    if snapshot_chunk is not None:
+        if snapshot_state is None:
+            raise ValueError("snapshot_chunk needs snapshot_state")
+        if snapshot_state.dtype != torch.float32:
+            raise ValueError(
+                f"snapshot_state must be fp32, got {snapshot_state.dtype}"
+            )
+        if snapshot_chunk.numel() != N or snapshot_state.shape[0] != N:
+            raise ValueError(
+                f"snapshot tensors must cover N={N} sequences, "
+                f"got chunk {tuple(snapshot_chunk.shape)} "
+                f"state {tuple(snapshot_state.shape)}"
+            )
+        snap_args = {
+            "snapshot_chunk": snapshot_chunk.to(torch.int32),
+            "snapshot_state": snapshot_state,
+        }
     _launch_k2(
         v_input=v,
         out=o,
@@ -1333,6 +1415,7 @@ def flash_kda_fwd(
         STORE_H_OUT=False,
         STORE_FINAL=store_final,
         **(paged_args if paged else {}),
+        **snap_args,
     )
 
     return o, final_state

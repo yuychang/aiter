@@ -780,19 +780,19 @@ def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
     assert torch.equal(o_auto, o_64), "an ineligible call should have resolved to 64"
 
 
-def _paged_pool(n, H, initial, pad_floats=0):
+def _paged_pool(n, H, initial, pad_floats=0, dtype=torch.float32):
     """V-first paged cache. ``pad_floats`` extra between slots."""
     V = K = K_DIM
     inner = H * V * K
     slot_stride = inner + pad_floats
-    storage = torch.zeros((n + 2) * slot_stride, device=device, dtype=torch.float32)
+    storage = torch.zeros((n + 2) * slot_stride, device=device, dtype=dtype)
     cache = torch.as_strided(
         storage,
         size=(n + 2, H, V, K),
         stride=(slot_stride, V * K, K, 1),
     )
     indices = torch.arange(n, 0, -1, device=device, dtype=torch.int32)
-    cache[indices] = initial
+    cache[indices] = initial.to(dtype)
     return cache, indices, storage
 
 
@@ -859,6 +859,93 @@ def test_paged_cache_matches_dense(T, chunks_per_seg):
     assert torch.equal(o_paged, o_dense)
     assert torch.equal(cache[indices], ht)
     assert torch.count_nonzero(cache[[0, -1]]).item() == 0
+
+
+def test_paged_bf16_store_stays_in_slot():
+    """A bf16 pool must be stored as bf16. An fp32 store would spill into the pad."""
+    H = 4
+    T = 128
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, T, H)
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    cache, indices, storage = _paged_pool(
+        1, H, h0, pad_floats=128, dtype=torch.bfloat16
+    )
+    before = storage.clone()
+    out = torch.empty_like(v)
+    flash_kda_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        lower_bound=LOWER_BOUND,
+        state_v_first=True,
+        chunks_per_seg=0,
+        out=out,
+        state_cache=cache,
+        state_indices=indices,
+        has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+    )
+    inner = H * K_DIM * K_DIM
+    slot = int(indices[0])
+    stride = inner + 128
+    pad = storage[slot * stride + inner : (slot + 1) * stride]
+    assert torch.equal(pad, before[slot * stride + inner : (slot + 1) * stride])
+    assert torch.equal(storage[:stride], before[:stride])
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(cache[indices].float()).all()
+
+
+@pytest.mark.parametrize("chunks_per_seg,at", [(0, 4), (4, 4), (4, 2)])
+def test_snapshot_matches_prefix_final_state(chunks_per_seg, at):
+    """The stored snapshot is the state entering that flash chunk."""
+    H = 4
+    T = 256
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, T, H)
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.05
+    tokens = at * FLASH_KDA_CHUNK
+    _, ht = flash_kda_fwd(
+        q=q[:, :tokens],
+        k=k[:, :tokens],
+        v=v[:, :tokens],
+        g=g[:, :tokens],
+        beta=beta[:, :tokens],
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        lower_bound=LOWER_BOUND,
+        initial_state=h0,
+        output_final_state=True,
+        state_v_first=True,
+        chunks_per_seg=chunks_per_seg,
+    )
+    cache, indices, _storage = _paged_pool(1, H, h0)
+    out = torch.empty_like(v)
+    snap = torch.full((1,), at, device=device, dtype=torch.int32)
+    buf = torch.empty(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+    flash_kda_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        lower_bound=LOWER_BOUND,
+        state_v_first=True,
+        chunks_per_seg=chunks_per_seg,
+        out=out,
+        state_cache=cache,
+        state_indices=indices,
+        has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+        snapshot_chunk=snap,
+        snapshot_state=buf,
+    )
+    assert torch.allclose(buf, ht, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("seg", ["0", "4"])
