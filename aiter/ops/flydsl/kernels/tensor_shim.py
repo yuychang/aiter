@@ -326,6 +326,26 @@ def _run_compiled(exe, *args, specialization_key=None):
         exe._cf_by_specialization[specialization_key] = cf
 
 
+def _run_compiled_ptrs(exe, pointer_args, *args):
+    """Dispatch a pointer-ABI launcher without allocating PointerJitArgs hot.
+
+    ``pointer_args`` is an iterable of ``(torch.Tensor, fx dtype)`` pairs.  The
+    first call wraps them so FlyDSL can resolve and compile the pointer
+    signature.  ``CompiledFunction``'s pointer ABI accepts integer addresses,
+    so later calls pass ``data_ptr()`` directly and avoid tensor layout
+    metadata, temporary views, and Python wrapper allocation.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*(tensor.data_ptr() for tensor, _ in pointer_args), *args)
+        return
+    _run_compiled(
+        exe,
+        *(ptr_arg(tensor, dtype) for tensor, dtype in pointer_args),
+        *args,
+    )
+
+
 def _preload_compiled(exe, *args):
     """Materialize a JIT artifact without dispatching its GPU kernels.
 

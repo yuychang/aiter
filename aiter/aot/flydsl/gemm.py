@@ -685,19 +685,19 @@ def _compile_preshuffle_to_cache(
         lds_stage=lds_stage,
         split_k=k_split,
     )
-    # The layout-API launcher uses fx.Tensor args (it builds views via
-    # fx.get_iter/make_view), so pass flat torch tensors directly rather
-    # than raw pointers (pointer args would fail GetIterOp type checks).
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    out_ptr_type = fx.BFloat16 if out_torch_dtype == torch.bfloat16 else fx.Float16
     _compile_executable_to_cache(
         exe,
-        workspace,
-        out,
-        semaphore,
-        a,
-        b,
-        scale_a,
-        scale_b,
-        bias,
+        ptr_arg(workspace, fx.Float32 if k_split > 1 else out_ptr_type),
+        ptr_arg(out, out_ptr_type),
+        ptr_arg(semaphore if k_split > 1 else out, fx.Int32),
+        ptr_arg(a, fx.Int8),
+        ptr_arg(b, fx.Int8),
+        ptr_arg(scale_a, fx.Float32),
+        ptr_arg(scale_b, fx.Float32),
+        ptr_arg(bias if bias.numel() else out, out_ptr_type),
         m,
         n,
         stream,
