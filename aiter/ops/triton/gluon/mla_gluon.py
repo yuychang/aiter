@@ -863,6 +863,32 @@ def mla_gluon(
     if k_pe is None:
         k_pe = kv_c
 
+    # Opt-in: verify (qlen > 1) with an fp8 KV cache streams KV once per
+    # (request, split, 64-row block) instead of once per query position.
+    from aiter.ops.triton.gluon.mla_gluon_packed_q import (
+        mla_gluon_packed_q,
+        mla_gluon_packed_q_enabled,
+        mla_gluon_packed_q_supported,
+    )
+
+    if mla_gluon_packed_q_enabled() and mla_gluon_packed_q_supported(
+        q_nope, q_pe, kv_c, k_pe, has_pe=has_pe, attn_sink=attn_sink
+    ):
+        return mla_gluon_packed_q(
+            q_nope,
+            q_pe,
+            kv_c,
+            o,
+            page_table,
+            seq_info,
+            sm_scale,
+            k_pe=k_pe,
+            kv_pe_offset=kv_pe_offset,
+            use_2d_view=use_2d_view,
+            kv_scale=kv_scale,
+            return_lse=return_lse,
+        )
+
     # Accept plain decode (3-D, qlen=1) or MTP (4-D, [batch, qlen, nhead, dim]).
     # DSv4 sparse prefill (has_pe=False) always uses the 3-D path.
     assert q_nope.dim() in (3, 4), f"q_nope must be 3-D or 4-D, got {q_nope.dim()}-D"
