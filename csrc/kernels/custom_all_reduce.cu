@@ -278,12 +278,6 @@ static bool _can_pack_2d_last_dim_slice(const aiter_tensor_t& inp, int m, int n)
            inp.stride(-1) == 1 && inp.stride(0) >= n && !inp.is_contiguous();
 }
 
-bool input_needs_staging(const aiter_tensor_t& inp, int64_t reg_inp_ptr)
-{
-    return reg_inp_ptr != 0 &&
-           inp.data_ptr() != reinterpret_cast<void*>(reg_inp_ptr);
-}
-
 static void _copy_input_to_registered_buffer(const aiter_tensor_t& inp,
                                              int m,
                                              int n,
@@ -291,9 +285,6 @@ static void _copy_input_to_registered_buffer(const aiter_tensor_t& inp,
                                              int64_t reg_ptr,
                                              int64_t reg_bytes)
 {
-    if(!input_needs_staging(inp, reg_ptr))
-        return;
-
     int64_t data_bytes = inp.numel() * inp.element_size();
     if(data_bytes > reg_bytes)
         throw std::runtime_error("registered buffer is too small to contain the input");
@@ -459,9 +450,8 @@ void all_reduce(fptr_t _fa,
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(inp, reg_inp_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         actual_inp = (void*)reg_inp_ptr;
     }
 
@@ -501,9 +491,8 @@ void all_reduce_residual(fptr_t _fa,
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(inp, reg_inp_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         actual_inp = (void*)reg_inp_ptr;
     }
 
@@ -561,9 +550,8 @@ void reduce_scatter(fptr_t _fa,
     {
         if(data_bytes > reg_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(inp, reg_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(),
                         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
                         sd, dtype);
@@ -601,9 +589,8 @@ void all_gather_unreg(fptr_t _fa,
 
     if(data_bytes > reg_bytes)
         throw std::runtime_error("registered buffer is too small to contain the input");
-    if(input_needs_staging(inp, reg_buffer))
-        HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
+    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
+                            hipMemcpyDeviceToDevice, stream));
     _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
 }
@@ -854,9 +841,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
     {
         if(data_bytes > reg_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(inp, reg_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         inp_ptr = (void*)reg_ptr;
     }
 
@@ -924,9 +910,8 @@ void fused_qknorm_allreduce(fptr_t _fa,
     {
         if(data_bytes > reg_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(qkv_in, reg_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         inp_ptr = (void*)reg_ptr;
     }
 
@@ -1009,9 +994,8 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
     {
         if(data_bytes > reg_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
-        if(input_needs_staging(qkv_in, reg_ptr))
-            HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
-                                    hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         inp_ptr = (void*)reg_ptr;
     }
 

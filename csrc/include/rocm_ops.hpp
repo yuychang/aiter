@@ -555,10 +555,6 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                 \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
-    m.def("input_needs_staging",                                                     \
-          &aiter::input_needs_staging,                                               \
-          py::arg("inp"),                                                            \
-          py::arg("reg_inp_ptr"));                                                   \
     m.def("all_reduce_residual",                                                     \
           &aiter::all_reduce_residual,                                               \
           py::arg("_fa"),                                                            \

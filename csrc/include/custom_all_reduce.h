@@ -38,7 +38,6 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
-bool input_needs_staging(const aiter_tensor_t& inp, int64_t reg_inp_ptr);
 void all_reduce_residual(fptr_t _fa,
                          const aiter_tensor_t& inp,
                          const aiter_tensor_t& out,

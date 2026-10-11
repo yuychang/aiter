@@ -36,10 +36,6 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
-def input_needs_staging(inp: torch.Tensor, reg_inp_ptr: int) -> bool: ...
-
-
-@compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce_residual(
     _fa: int,
     inp: torch.Tensor,
