@@ -1,0 +1,13 @@
+M,N,K,q_dtype_w
+512,6144,7168,torch.float8_e4m3fn
+1024,6144,7168,torch.float8_e4m3fn
+2048,6144,7168,torch.float8_e4m3fn
+4096,6144,7168,torch.float8_e4m3fn
+512,128,7168,torch.float8_e4m3fn
+1024,128,7168,torch.float8_e4m3fn
+2048,128,7168,torch.float8_e4m3fn
+4096,128,7168,torch.float8_e4m3fn
+8192,128,7168,torch.float8_e4m3fn
+65536,3072,512,torch.float8_e4m3fn
+4096,7168,3584,torch.float8_e4m3fn
+8192,7168,3584,torch.float8_e4m3fn
