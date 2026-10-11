@@ -129,6 +129,7 @@ def main() -> None:
     parser.add_argument("--profiler-calls", type=int, default=50)
     parser.add_argument("--reference-dir", type=Path)
     parser.add_argument("--compare-dir", type=Path)
+    parser.add_argument("--gpu-free-sentinel", type=Path)
     args = parser.parse_args()
 
     imported = Path(aiter.__file__).resolve()
@@ -150,6 +151,13 @@ def main() -> None:
     }
 
     for k, n in SHAPES:
+        if (
+            args.gpu_free_sentinel is not None
+            and not args.gpu_free_sentinel.exists()
+        ):
+            raise RuntimeError(
+                f"GPU permission sentinel disappeared: {args.gpu_free_sentinel}"
+            )
         config = rows[(k, n)]
         # Isolate dynamic-M launch behavior from the table's per-M tuning
         # choice: every M deliberately uses this one valid tuned executable.
