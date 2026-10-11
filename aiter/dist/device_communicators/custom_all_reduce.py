@@ -18,7 +18,7 @@
 import os
 import pickle
 from contextlib import contextmanager
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Sequence
 
 import torch
 import torch.distributed as dist
@@ -1158,6 +1158,69 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
+    def get_registered_input_buffer(
+        self,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return a contiguous typed view of the registered input pool.
+
+        Producers may write directly into this fixed-address view and then use
+        the normal ``registered_input=False`` collective path. The C++ wrapper
+        recognizes exact base-pointer equality and skips staging while retaining
+        the unregistered-output kernel mode.
+
+        The pool has one base address. Callers must serialize collectives that
+        consume it and must not request overlapping producer lifetimes.
+        """
+        if self.disabled:
+            raise RuntimeError("custom all-reduce is disabled")
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"dtype must be torch.dtype, got {type(dtype).__name__}")
+        dims = tuple(int(dim) for dim in shape)
+        if not dims or any(dim < 0 for dim in dims):
+            raise ValueError(f"shape must contain non-negative dimensions, got {dims}")
+        numel = 1
+        for dim in dims:
+            numel *= dim
+        nbytes = numel * dtype.itemsize
+        pool = self._pool["input"]
+        if nbytes > pool.max_size:
+            raise ValueError(
+                f"requested registered input view is {nbytes} bytes, "
+                f"but the pool holds {pool.max_size} bytes"
+            )
+
+        storage = getattr(self, "_registered_input_storage", None)
+        if storage is None:
+            storage = torch._C._construct_storage_from_data_pointer(
+                pool.data_ptr,
+                self.device,
+                pool.max_size,
+            )
+            self._registered_input_storage = storage
+
+        strides = []
+        stride = 1
+        for dim in reversed(dims):
+            strides.append(stride)
+            stride *= dim
+        metadata = {
+            "nbytes": pool.max_size,
+            "data_ptr": pool.data_ptr,
+            "size": dims,
+            "stride": tuple(reversed(strides)),
+            "dtype": dtype,
+            "device": self.device,
+            "storage_offset": 0,
+        }
+        view = torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(
+            metadata, storage
+        )
+        if view.data_ptr() != pool.data_ptr:
+            raise RuntimeError("registered input tensor does not start at the pool base")
+        return view
+
     def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
@@ -2250,6 +2313,8 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
+        # Drop all non-owning tensor/storage aliases before freeing the pool.
+        self._registered_input_storage = None
         # Free the meta + input (max_size, up to 1 GB) buffers deterministically
         # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
         pool = getattr(self, "_pool", None)
