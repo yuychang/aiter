@@ -36,6 +36,7 @@ PAGE_SIZE = 128
 SM_SCALE = (128 + 64) ** -0.5  # Kimi-K3 qk_nope_head_dim + qk_rope_head_dim
 FP8 = torch.float8_e4m3fn
 PACKED_ENV = "AITER_MLA_GLUON_PACKED_Q"
+MIN_ROWS_ENV = "AITER_MLA_GLUON_PACKED_Q_MIN_ROWS"
 
 
 def _is_gfx950():
@@ -48,16 +49,19 @@ pytestmark = pytest.mark.skipif(not _is_gfx950(), reason="Gluon MLA is gfx950-on
 
 
 @contextmanager
-def packed_q(enabled):
-    old = os.environ.get(PACKED_ENV)
+def packed_q(enabled, min_rows=1):
+    """Toggle the packed kernel; min_rows=1 runs it on every shape it supports."""
+    saved = {k: os.environ.get(k) for k in (PACKED_ENV, MIN_ROWS_ENV)}
     os.environ[PACKED_ENV] = "1" if enabled else "0"
+    os.environ[MIN_ROWS_ENV] = str(min_rows)
     try:
         yield
     finally:
-        if old is None:
-            os.environ.pop(PACKED_ENV, None)
-        else:
-            os.environ[PACKED_ENV] = old
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def make_case(
@@ -220,6 +224,23 @@ def test_verify_other_heads(nhead):
 def test_verify_return_lse(batch):
     lens = [3000 + 17 * i for i in range(batch)]
     check(make_case(lens, 8, seed=3), True, return_lse=True)
+
+
+@pytest.mark.parametrize(
+    "batch, qlen, expected", [(1, 4, False), (1, 8, True), (2, 4, True), (1, 1, False)]
+)
+def test_packed_min_rows_fallback(batch, qlen, expected):
+    from aiter.ops.triton.gluon.mla_gluon_packed_q import mla_gluon_packed_q_supported
+
+    q_nope = torch.empty(batch, qlen, NHEAD, 512, dtype=torch.bfloat16)
+    q_pe = torch.empty(batch, qlen, NHEAD, 64, dtype=torch.bfloat16)
+    kv = torch.empty(16, 576, dtype=FP8)
+    saved = os.environ.pop(MIN_ROWS_ENV, None)
+    try:
+        assert mla_gluon_packed_q_supported(q_nope, q_pe, kv, None) is expected
+    finally:
+        if saved is not None:
+            os.environ[MIN_ROWS_ENV] = saved
 
 
 def test_verify_kv_scale_one():

@@ -52,6 +52,7 @@ _BLOCK_N = 64
 _DEFAULT_WG_BUDGET = 256
 _DEFAULT_WARPS_N = 2
 _DEFAULT_STAGES = 2
+_DEFAULT_MIN_ROWS = 8
 
 
 def mla_gluon_packed_q_enabled() -> bool:
@@ -469,13 +470,23 @@ def packed_q_launch_params(batch_size, qlen, nhead, wg_budget=None):
 
 
 def mla_gluon_packed_q_supported(q_nope, q_pe, kv_c, k_pe, has_pe=True, attn_sink=None):
-    """Shapes the packed-query kernel handles; mla_gluon keeps everything else."""
+    """Shapes the packed-query kernel handles; mla_gluon keeps everything else.
+
+    Below AITER_MLA_GLUON_PACKED_Q_MIN_ROWS (batch * qlen, default 8) the
+    packed kernel's 256 workgroups hold one or two KV tiles each at short
+    contexts and lose to mla_gluon, so those launches stay on mla_gluon. The
+    choice depends only on (batch, qlen), like the launch parameters.
+    """
     if q_nope.dim() != 4 or not has_pe or attn_sink is not None:
         return False
-    _, qlen, nhead, head_dim_ckv = q_nope.shape
+    batch_size, qlen, nhead, head_dim_ckv = q_nope.shape
     k_pe = kv_c if k_pe is None else k_pe
+    min_rows = int(
+        os.environ.get("AITER_MLA_GLUON_PACKED_Q_MIN_ROWS", _DEFAULT_MIN_ROWS)
+    )
     return (
         qlen >= 2
+        and batch_size * qlen >= min_rows
         and 1 <= nhead <= _BLOCK_M
         and head_dim_ckv == 512
         and q_pe.shape[-1] == 64
