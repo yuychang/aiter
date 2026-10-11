@@ -26,9 +26,9 @@
 # that reach past min(split end, first causal limit of the block) are masked;
 # every other tile runs the unmasked step.
 #
-# Pipeline (BLOCK_N=64, KV double-buffered in LDS, KV indices prefetched in
-# registers one tile further ahead):
-#   iter i: wait copy[i] -> barrier -> async copy KV[i+1] -> load indices[i+2]
+# Pipeline (BLOCK_N=64; KV and the KV slot indices double-buffered in LDS, the
+# indices one tile ahead of KV, all moved by async copies):
+#   iter i: wait copies -> barrier -> async copy KV[i+1], indices[i+2]
 #           -> QK mfma, softmax, PV mfma on KV[i]
 #
 # Warps tile M (4 x 16 rows) so the softmax is warp-local; every warp reads the
@@ -101,31 +101,33 @@ def _packed_q_step(
 
 @gluon.jit
 def _packed_q_issue_kv(
-    bufs_kv, bufs_kpe, buf,
+    bufs_kv, bufs_kpe, kv_slot, idx_buf,
     Kv_c_cache, K_pe_cache,
-    loc_kv, loc_pe, tile_lo, split_kv_end,
+    tile_lo, split_kv_end,
     offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe,
     stride_kv_c_bs, stride_k_pe_bs,
     KV_PE_OFFSET: gl.constexpr,
     WITHIN_2GB: gl.constexpr,
 ):
+    # KV slot index of each token of the tile, staged in LDS by _packed_q_issue_idx.
+    loc_kv = gl.amd.cdna4.async_copy.load_shared_relaxed(idx_buf, offs_tok_kv.type.layout)
+    loc_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(idx_buf, offs_tok_pe.type.layout)
     offs_k_c = loc_kv[None, :] * stride_kv_c_bs + offs_d_kv[:, None]
     mask_kv = (tile_lo + offs_tok_kv)[None, :] < split_kv_end
     offs_k_pe = loc_pe[None, :] * stride_k_pe_bs + offs_d_pe[:, None] + KV_PE_OFFSET
     mask_pe = (tile_lo + offs_tok_pe)[None, :] < split_kv_end
     if WITHIN_2GB:
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(buf), Kv_c_cache, offs_k_c, mask=mask_kv)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(buf), K_pe_cache, offs_k_pe, mask=mask_pe)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(kv_slot), Kv_c_cache, offs_k_c, mask=mask_kv)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(kv_slot), K_pe_cache, offs_k_pe, mask=mask_pe)
     else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(buf), Kv_c_cache + offs_k_c, mask=mask_kv, other=0.0)
-        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(buf), K_pe_cache + offs_k_pe, mask=mask_pe, other=0.0)
-    gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(kv_slot), Kv_c_cache + offs_k_c, mask=mask_kv, other=0.0)
+        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(kv_slot), K_pe_cache + offs_k_pe, mask=mask_pe, other=0.0)
 
 
 @gluon.jit
-def _packed_q_load_loc(Kv_indices, batch_page_start, tile_lo, split_kv_end, offs_tok):
+def _packed_q_issue_idx(idx_buf, Kv_indices, batch_page_start, tile_lo, split_kv_end, offs_tok):
     tok = tile_lo + offs_tok
-    return gl.amd.cdna4.buffer_load(Kv_indices, batch_page_start + tok, mask=tok < split_kv_end, other=0)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(idx_buf, Kv_indices, batch_page_start + tok, mask=tok < split_kv_end)
 
 
 @gluon.jit
@@ -274,6 +276,15 @@ def _mla_gluon_packed_q(
         block_bases=[],
         shape=[512, 64],
     )
+    # KV slot indices: one int32 per lane, warps write the same copy.
+    blocked_idx: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[],
+        lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+        warp_bases=((0,), (0,)),
+        block_bases=[],
+        shape=[64],
+    )
+    shared_idx: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
     mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
     dtype = Q_nope.type.element_ty
@@ -300,24 +311,28 @@ def _mla_gluon_packed_q(
     gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask=row_ok_qpe[:, None])
     gl.amd.cdna4.async_copy.commit_group()
 
-    ######### KV prologue: copy tile 0, prefetch indices of tile 1 #########
+    ######### KV prologue #########
+    # Indices run one tile ahead of KV: copy KV[0] needs indices[0] in LDS
+    # first, and every iteration i copies KV[i+1] and indices[i+2].
     bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
     bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+    bufs_idx = gl.allocate_shared_memory(gl.int32, shape=[2, BLOCK_N], layout=shared_idx)
     offs_tok_kv = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
     offs_d_kv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
     offs_tok_pe = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
     offs_d_pe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
+    offs_tok_idx = gl.arange(0, BLOCK_N, layout=blocked_idx)
 
-    loc_kv = _packed_q_load_loc(Kv_indices, batch_page_start, split_kv_start, split_kv_end, offs_tok_kv)
-    loc_pe = _packed_q_load_loc(Kv_indices, batch_page_start, split_kv_start, split_kv_end, offs_tok_pe)
-    _packed_q_issue_kv(bufs_kv, bufs_kpe, 0, Kv_c_cache, K_pe_cache, loc_kv, loc_pe, split_kv_start, split_kv_end,
+    _packed_q_issue_idx(bufs_idx.index(0), Kv_indices, batch_page_start, split_kv_start, split_kv_end, offs_tok_idx)
+    _packed_q_issue_idx(bufs_idx.index(1), Kv_indices, batch_page_start, split_kv_start + BLOCK_N, split_kv_end, offs_tok_idx)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.barrier()
+    _packed_q_issue_kv(bufs_kv, bufs_kpe, 0, bufs_idx.index(0), Kv_c_cache, K_pe_cache, split_kv_start, split_kv_end,
                        offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs, stride_k_pe_bs,
                        KV_PE_OFFSET, WITHIN_2GB)
-    loc_kv = _packed_q_load_loc(Kv_indices, batch_page_start, split_kv_start + BLOCK_N, split_kv_end, offs_tok_kv)
-    loc_pe = _packed_q_load_loc(Kv_indices, batch_page_start, split_kv_start + BLOCK_N, split_kv_end, offs_tok_pe)
+    gl.amd.cdna4.async_copy.commit_group()
 
-    gl.amd.cdna4.async_copy.wait_group(1)
-    gl.barrier()
     q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
     q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
@@ -341,13 +356,16 @@ def _mla_gluon_packed_q(
     for i in range(num_unmasked):
         buf = i % 2
         tile_lo = split_kv_start + i * BLOCK_N
+        # KV[i] and indices[i+1] have landed for every warp; nobody still
+        # reads the slots refilled below.
         gl.amd.cdna4.async_copy.wait_group(0)
         gl.barrier()
-        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, Kv_c_cache, K_pe_cache, loc_kv, loc_pe, tile_lo + BLOCK_N,
-                           split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs,
-                           stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
-        loc_kv = _packed_q_load_loc(Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end, offs_tok_kv)
-        loc_pe = _packed_q_load_loc(Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end, offs_tok_pe)
+        _packed_q_issue_idx(bufs_idx.index(buf), Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end,
+                            offs_tok_idx)
+        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, bufs_idx.index(1 - buf), Kv_c_cache, K_pe_cache,
+                           tile_lo + BLOCK_N, split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe,
+                           stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
+        gl.amd.cdna4.async_copy.commit_group()
         acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(buf), bufs_kpe.index(buf),
                                            tile_lo, row_limit, qk_scale, False, BLOCK_M, BLOCK_N,
                                            mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
@@ -357,11 +375,12 @@ def _mla_gluon_packed_q(
         tile_lo = split_kv_start + i * BLOCK_N
         gl.amd.cdna4.async_copy.wait_group(0)
         gl.barrier()
-        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, Kv_c_cache, K_pe_cache, loc_kv, loc_pe, tile_lo + BLOCK_N,
-                           split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs,
-                           stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
-        loc_kv = _packed_q_load_loc(Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end, offs_tok_kv)
-        loc_pe = _packed_q_load_loc(Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end, offs_tok_pe)
+        _packed_q_issue_idx(bufs_idx.index(buf), Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end,
+                            offs_tok_idx)
+        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, bufs_idx.index(1 - buf), Kv_c_cache, K_pe_cache,
+                           tile_lo + BLOCK_N, split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe,
+                           stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
+        gl.amd.cdna4.async_copy.commit_group()
         acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(buf), bufs_kpe.index(buf),
                                            tile_lo, row_limit, qk_scale, True, BLOCK_M, BLOCK_N,
                                            mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
