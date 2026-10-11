@@ -26,14 +26,14 @@
 # that reach past min(split end, first causal limit of the block) are masked;
 # every other tile runs the unmasked step.
 #
-# Pipeline (BLOCK_N=64; KV and the KV slot indices double-buffered in LDS, the
-# indices one tile ahead of KV, all moved by async copies):
-#   iter i: wait copies -> barrier -> async copy KV[i+1], indices[i+2]
+# Pipeline (BLOCK_N=64; NUM_STAGES KV slots and 2 * (NUM_STAGES - 1) index
+# slots in LDS, all moved by async copies, P = NUM_STAGES - 1):
+#   iter i: wait copies -> barrier -> async copy KV[i+P], indices[i+2P]
 #           -> QK mfma, softmax, PV mfma on KV[i]
 #
-# Warps tile M (4 x 16 rows) so the softmax is warp-local; every warp reads the
-# whole KV tile from LDS, which is why BLOCK_N is 64 rather than 128 (a
-# [512, 128] B operand per warp does not fit next to the [16, 512] fp32 acc).
+# Warps form a (4 / WARPS_N) x WARPS_N grid over the [64, 64] QK tile. A
+# [512, 128] B operand per warp does not fit next to the fp32 acc, hence
+# BLOCK_N = 64.
 
 import os
 
@@ -44,15 +44,22 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.gluon.mla_gluon import _mla_softmax_reducev_kernel
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 PACKED_Q_ENV = "AITER_MLA_GLUON_PACKED_Q"
 _BLOCK_M = 64
 _BLOCK_N = 64
 _DEFAULT_WG_BUDGET = 256
+_DEFAULT_WARPS_N = 2
+_DEFAULT_STAGES = 2
 
 
 def mla_gluon_packed_q_enabled() -> bool:
     return os.environ.get(PACKED_Q_ENV, "0") == "1"
+
+
+def _xcd_remap_enabled() -> bool:
+    return os.environ.get("AITER_MLA_GLUON_PACKED_Q_XCD", "0") == "1"
 
 
 # fmt: off
@@ -163,6 +170,7 @@ def _mla_gluon_packed_q(
     stride_final_lse_b,
     stride_final_lse_s,
     stride_final_lse_h,
+    num_work,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -175,14 +183,34 @@ def _mla_gluon_packed_q(
     QLEN: gl.constexpr,
     Q_PER_BLOCK: gl.constexpr,
     RETURN_LSE: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    NUM_M_BLOCKS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     gl.static_assert(BLOCK_M == 64)
     gl.static_assert(BLOCK_N == 64)
+    gl.static_assert(WARPS_N == 1 or WARPS_N == 2)
+    gl.static_assert(NUM_STAGES >= 2)
     gl.static_assert(Q_PER_BLOCK * NHEAD <= BLOCK_M)
 
-    cur_batch = gl.program_id(0)
-    split_kv_id = gl.program_id(1)
-    m_block = gl.program_id(2)
+    if NUM_XCDS > 1:
+        # 1-D grid padded to a multiple of NUM_XCDS. Workgroups go round-robin
+        # over XCDs, so give each XCD a contiguous run of logical ids with the
+        # row block fastest: the row blocks of one (request, split) then run
+        # side by side on one XCD and share its L2 for the KV tiles.
+        pid = gl.program_id(0)
+        num_programs = gl.num_programs(0)
+        work_id = (pid % NUM_XCDS) * (num_programs // NUM_XCDS) + pid // NUM_XCDS
+        if work_id >= num_work:
+            return
+        m_block = work_id % NUM_M_BLOCKS
+        split_kv_id = (work_id // NUM_M_BLOCKS) % NUM_KV_SPLITS
+        cur_batch = work_id // (NUM_M_BLOCKS * NUM_KV_SPLITS)
+    else:
+        cur_batch = gl.program_id(0)
+        split_kv_id = gl.program_id(1)
+        m_block = gl.program_id(2)
 
     # USE_2D_VIEW=True: Kv_indices = block_table[batch, max_seqlen], Seq_info = cache_seqlens[batch]
     # USE_2D_VIEW=False: Kv_indices = kv_indices[total_kv],          Seq_info = kv_indptr[batch+1]
@@ -234,11 +262,14 @@ def _mla_gluon_packed_q(
         cga_layout=[],
         shape=[64, 64]
     )
+    # WARPS_N=1: warps tile M only; every warp converts and multiplies the
+    # whole KV tile. WARPS_N=2: a 2x2 warp grid halves the per-warp fp8->bf16
+    # conversion and LDS reads at the cost of cross-warp softmax / P exchange.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[4, 1],
+        warps_per_cta=[4 // WARPS_N, WARPS_N],
     )
     # KV side: fp8 [512, 64] / [64, 64] tiles, 16 B per lane per async copy
     # (the first half of mla_gluon's bh16bn128 [*, 128] tiles).
@@ -268,14 +299,24 @@ def _mla_gluon_packed_q(
         cga_layout=[],
         shape=[64, 64]
     )
-    # V read for the PV mfma; warps broadcast because each warp needs all of V.
-    linear_v: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-        warp_bases=((0, 0), (0, 0)),
-        block_bases=[],
-        shape=[512, 64],
-    )
+    # V read for the PV mfma: the transpose of the PV B-operand layout, so the
+    # LDS read is ds_read_b64_tr_b8 and the permute + convert is free.
+    if WARPS_N == 1:
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((0, 0), (0, 0)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+    else:
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (32, 0), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((16, 0), (0, 0)),
+            block_bases=[],
+            shape=[512, 64],
+        )
     # KV slot indices: one int32 per lane, warps write the same copy.
     blocked_idx: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[],
@@ -312,29 +353,36 @@ def _mla_gluon_packed_q(
     gl.amd.cdna4.async_copy.commit_group()
 
     ######### KV prologue #########
-    # Indices run one tile ahead of KV: copy KV[0] needs indices[0] in LDS
-    # first, and every iteration i copies KV[i+1] and indices[i+2].
-    bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
-    bufs_idx = gl.allocate_shared_memory(gl.int32, shape=[2, BLOCK_N], layout=shared_idx)
+    # PREFETCH = NUM_STAGES - 1 KV tiles are in flight while one is computed.
+    # Iteration i copies KV[i + PREFETCH] and the slot indices of tile
+    # i + 2 * PREFETCH, so the indices a KV copy needs always arrive in an older
+    # commit group than the one being waited on.
+    PREFETCH: gl.constexpr = NUM_STAGES - 1
+    NUM_IDX: gl.constexpr = 2 * PREFETCH
+    bufs_idx = gl.allocate_shared_memory(gl.int32, shape=[NUM_IDX, BLOCK_N], layout=shared_idx)
+    offs_tok_idx = gl.arange(0, BLOCK_N, layout=blocked_idx)
+    for j in gl.static_range(NUM_IDX):
+        _packed_q_issue_idx(bufs_idx.index(j), Kv_indices, batch_page_start, split_kv_start + j * BLOCK_N,
+                            split_kv_end, offs_tok_idx)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.barrier()
+    q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
+    q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
+
+    # Allocated after Q's last LDS read so the allocator can reuse Q's space.
+    bufs_kv = gl.allocate_shared_memory(kvtype, shape=[NUM_STAGES, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[NUM_STAGES, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
     offs_tok_kv = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
     offs_d_kv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
     offs_tok_pe = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
     offs_d_pe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-    offs_tok_idx = gl.arange(0, BLOCK_N, layout=blocked_idx)
-
-    _packed_q_issue_idx(bufs_idx.index(0), Kv_indices, batch_page_start, split_kv_start, split_kv_end, offs_tok_idx)
-    _packed_q_issue_idx(bufs_idx.index(1), Kv_indices, batch_page_start, split_kv_start + BLOCK_N, split_kv_end, offs_tok_idx)
-    gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.wait_group(0)
     gl.barrier()
-    _packed_q_issue_kv(bufs_kv, bufs_kpe, 0, bufs_idx.index(0), Kv_c_cache, K_pe_cache, split_kv_start, split_kv_end,
-                       offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs, stride_k_pe_bs,
-                       KV_PE_OFFSET, WITHIN_2GB)
-    gl.amd.cdna4.async_copy.commit_group()
-
-    q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
-    q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
+    for j in gl.static_range(PREFETCH):
+        _packed_q_issue_kv(bufs_kv, bufs_kpe, j, bufs_idx.index(j), Kv_c_cache, K_pe_cache,
+                           split_kv_start + j * BLOCK_N, split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe,
+                           offs_d_pe, stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
+        gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
@@ -354,36 +402,36 @@ def _mla_gluon_packed_q(
     num_unmasked = gl.minimum(gl.maximum(mask_from - split_kv_start, 0) // BLOCK_N, num_iter)
 
     for i in range(num_unmasked):
-        buf = i % 2
         tile_lo = split_kv_start + i * BLOCK_N
-        # KV[i] and indices[i+1] have landed for every warp; nobody still
-        # reads the slots refilled below.
-        gl.amd.cdna4.async_copy.wait_group(0)
+        # KV[i] and the indices of tile i + PREFETCH have landed for every
+        # warp, and nobody still reads the slots refilled below.
+        gl.amd.cdna4.async_copy.wait_group(PREFETCH - 1)
         gl.barrier()
-        _packed_q_issue_idx(bufs_idx.index(buf), Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end,
-                            offs_tok_idx)
-        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, bufs_idx.index(1 - buf), Kv_c_cache, K_pe_cache,
-                           tile_lo + BLOCK_N, split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe,
-                           stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
+        _packed_q_issue_idx(bufs_idx.index(i % NUM_IDX), Kv_indices, batch_page_start,
+                            tile_lo + NUM_IDX * BLOCK_N, split_kv_end, offs_tok_idx)
+        _packed_q_issue_kv(bufs_kv, bufs_kpe, (i + PREFETCH) % NUM_STAGES, bufs_idx.index((i + PREFETCH) % NUM_IDX),
+                           Kv_c_cache, K_pe_cache, tile_lo + PREFETCH * BLOCK_N, split_kv_end, offs_tok_kv,
+                           offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET,
+                           WITHIN_2GB)
         gl.amd.cdna4.async_copy.commit_group()
-        acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(buf), bufs_kpe.index(buf),
-                                           tile_lo, row_limit, qk_scale, False, BLOCK_M, BLOCK_N,
-                                           mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
+        acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(i % NUM_STAGES),
+                                           bufs_kpe.index(i % NUM_STAGES), tile_lo, row_limit, qk_scale, False,
+                                           BLOCK_M, BLOCK_N, mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
 
     for i in range(num_unmasked, num_iter):
-        buf = i % 2
         tile_lo = split_kv_start + i * BLOCK_N
-        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.amd.cdna4.async_copy.wait_group(PREFETCH - 1)
         gl.barrier()
-        _packed_q_issue_idx(bufs_idx.index(buf), Kv_indices, batch_page_start, tile_lo + 2 * BLOCK_N, split_kv_end,
-                            offs_tok_idx)
-        _packed_q_issue_kv(bufs_kv, bufs_kpe, 1 - buf, bufs_idx.index(1 - buf), Kv_c_cache, K_pe_cache,
-                           tile_lo + BLOCK_N, split_kv_end, offs_tok_kv, offs_d_kv, offs_tok_pe, offs_d_pe,
-                           stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET, WITHIN_2GB)
+        _packed_q_issue_idx(bufs_idx.index(i % NUM_IDX), Kv_indices, batch_page_start,
+                            tile_lo + NUM_IDX * BLOCK_N, split_kv_end, offs_tok_idx)
+        _packed_q_issue_kv(bufs_kv, bufs_kpe, (i + PREFETCH) % NUM_STAGES, bufs_idx.index((i + PREFETCH) % NUM_IDX),
+                           Kv_c_cache, K_pe_cache, tile_lo + PREFETCH * BLOCK_N, split_kv_end, offs_tok_kv,
+                           offs_d_kv, offs_tok_pe, offs_d_pe, stride_kv_c_bs, stride_k_pe_bs, KV_PE_OFFSET,
+                           WITHIN_2GB)
         gl.amd.cdna4.async_copy.commit_group()
-        acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(buf), bufs_kpe.index(buf),
-                                           tile_lo, row_limit, qk_scale, True, BLOCK_M, BLOCK_N,
-                                           mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
+        acc, e_max, e_sum = _packed_q_step(q_nope, q_pe, acc, e_max, e_sum, bufs_kv.index(i % NUM_STAGES),
+                                           bufs_kpe.index(i % NUM_STAGES), tile_lo, row_limit, qk_scale, True,
+                                           BLOCK_M, BLOCK_N, mfma_layout, mfma_layout_a, mfma_layout_b, linear_v)
     gl.amd.cdna4.async_copy.wait_group(0)
 
     ######### epilogue #########
@@ -471,6 +519,9 @@ def mla_gluon_packed_q(
         batch_size, qlen, nhead, wg_budget
     )
 
+    warps_n = int(os.environ.get("AITER_MLA_GLUON_PACKED_Q_WARPS_N", _DEFAULT_WARPS_N))
+    num_stages = int(os.environ.get("AITER_MLA_GLUON_PACKED_Q_STAGES", _DEFAULT_STAGES))
+
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000
 
@@ -501,7 +552,12 @@ def mla_gluon_packed_q(
         final_lse = None
         final_lse_strides = (0, 0, 0)
 
-    grid = (batch_size, num_kv_splits, num_m_blocks)
+    num_xcds = get_num_xcds() if num_m_blocks > 1 and _xcd_remap_enabled() else 1
+    num_work = batch_size * num_kv_splits * num_m_blocks
+    if num_xcds > 1:
+        grid = (triton.cdiv(num_work, num_xcds) * num_xcds, 1, 1)
+    else:
+        grid = (batch_size, num_kv_splits, num_m_blocks)
     _mla_gluon_packed_q[grid](
         q_nope,
         q_pe,
@@ -525,6 +581,7 @@ def mla_gluon_packed_q(
         *mid_lse_strides,
         final_lse,
         *final_lse_strides,
+        num_work,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
         NUM_KV_SPLITS=num_kv_splits,
@@ -537,6 +594,10 @@ def mla_gluon_packed_q(
         QLEN=qlen,
         Q_PER_BLOCK=q_per_block,
         RETURN_LSE=return_lse,
+        WARPS_N=warps_n,
+        NUM_M_BLOCKS=num_m_blocks,
+        NUM_XCDS=num_xcds,
+        NUM_STAGES=num_stages,
         num_warps=4,
     )
 
