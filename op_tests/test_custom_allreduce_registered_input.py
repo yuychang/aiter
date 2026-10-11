@@ -34,6 +34,16 @@ def test_registered_input_view_and_cpp_staging_predicate():
         assert ordinary.data_ptr() != ptr
         assert ops.input_needs_staging(ordinary, ptr)
 
+        # The external raw allocation has a fixed address and can be a graph
+        # output without involving PyTorch's expandable-segment allocator.
+        source = torch.ones_like(view)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            torch.add(source, 2, out=view)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(view, torch.full_like(view, 3))
+
         offset = view[:, 1:]
         assert offset.data_ptr() != ptr
         assert ops.input_needs_staging(offset, ptr)
