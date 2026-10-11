@@ -14,12 +14,19 @@ from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 
-def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
-    # max_size=False with no num_records_bytes: cosize(layout) becomes a
-    # runtime expression because TensorAdaptor defaults to layout-dynamic
-    # memref (post #554), so the descriptor adapts to the actual tensor
-    # extent and no longer bakes the first-call's shape into IR.
-    t_i8 = fx.rocdl.make_buffer_tensor(arg_i8, max_size=False)
+_FLAT_PTR_VIEW_ELEMS = 0x7FFFFFFF
+
+
+def _flat_ptr_tensor(ptr):
+    return fx.Tensor(fx.make_view(ptr, fx.make_layout(_FLAT_PTR_VIEW_ELEMS, 1)))
+
+
+def make_fp8_buffer_tensor(arg_i8, fp8_ir_t, num_records_bytes):
+    t_i8 = fx.rocdl.make_buffer_tensor(
+        _flat_ptr_tensor(arg_i8),
+        max_size=False,
+        num_records_bytes=num_records_bytes,
+    )
     iter_i8 = fx.get_iter(t_i8)
     f8_buf_ptr_ty = fx.PointerType.get(
         elem_ty=fp8_ir_t,
@@ -154,12 +161,14 @@ class StoreC:
         c_nbytes = c_rows * c_cols * 2  # BFloat16 = 2 bytes
         sa_nbytes = c_rows * 4  # Float32 row-wise scale
         sb_nbytes = c_cols * 4  # Float32 col-wise scale
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        gC = fx.rocdl.make_buffer_tensor(
+            _flat_ptr_tensor(C), max_size=False, num_records_bytes=c_nbytes
+        )
         gSA = fx.rocdl.make_buffer_tensor(
-            A_scale, max_size=False, num_records_bytes=sa_nbytes
+            _flat_ptr_tensor(A_scale), max_size=False, num_records_bytes=sa_nbytes
         )
         gSB = fx.rocdl.make_buffer_tensor(
-            B_scale, max_size=False, num_records_bytes=sb_nbytes
+            _flat_ptr_tensor(B_scale), max_size=False, num_records_bytes=sb_nbytes
         )
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
@@ -361,11 +370,11 @@ def compile_fp8_gemm_8w(
 
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gemm(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        A: fx.Pointer,
+        B_T: fx.Pointer,
+        C: fx.Pointer,
+        A_scale: fx.Pointer,
+        B_scale: fx.Pointer,
         c_m: fx.Int32,
         c_n: fx.Int32,
     ):
@@ -400,8 +409,8 @@ def compile_fp8_gemm_8w(
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
 
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        gA = make_fp8_buffer_tensor(A, F8_IR_t, fx.Int64(c_m) * fx.Int64(K))
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t, fx.Int64(c_n) * fx.Int64(K))
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -538,11 +547,11 @@ def compile_fp8_gemm_8w(
 
     @flyc.jit
     def launch_gemm(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        A: fx.Pointer,
+        B_T: fx.Pointer,
+        C: fx.Pointer,
+        A_scale: fx.Pointer,
+        B_scale: fx.Pointer,
         c_m: fx.Int32,
         c_n: fx.Int32,
         stream: fx.Stream,
