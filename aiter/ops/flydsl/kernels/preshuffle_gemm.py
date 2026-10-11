@@ -900,14 +900,14 @@ def compile_preshuffle_gemm(
     # ── Host launcher ─────────────────────────────────────────────
     @flyc.jit
     def launch_gemm(
-        arg_c: fx.Tensor,
-        arg_out: fx.Tensor,
-        arg_semaphore: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_out: fx.Pointer,
+        arg_semaphore: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
@@ -962,7 +962,7 @@ def compile_preshuffle_gemm(
         s_n0 = k0 * s_k0
         preshuffle_B = fx.Tensor(
             fx.make_view(
-                fx.get_iter(arg_b),
+                arg_b,
                 fx.make_layout(
                     ((16, n0), (kp_elems, 4, k0)), ((s_nlane, s_n0), (1, s_klane, s_k0))
                 ),
@@ -971,15 +971,20 @@ def compile_preshuffle_gemm(
 
         # Reshape A and C to 2D
         M_max = PRESHUFFLE_M_MAX
-        arg_a_2d = fx.Tensor(
-            fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1)))
-        )
+        arg_a_2d = fx.Tensor(fx.make_view(arg_a, fx.make_layout((M_max, K), (K, 1))))
         arg_c_2d = fx.Tensor(
             fx.make_view(
-                fx.get_iter(arg_c),
+                arg_c,
                 fx.make_layout((M_max, n_padded), (n_padded, 1)),
             )
         )
+        arg_out_2d = fx.Tensor(
+            fx.make_view(arg_out, fx.make_layout((M_max, N), (N, 1)))
+        )
+        semaphore_1d = fx.Tensor(fx.make_view(arg_semaphore, fx.make_layout(1, 1)))
+        scale_a_1d = fx.Tensor(fx.make_view(arg_scale_a, fx.make_layout(M_max, 1)))
+        scale_b_1d = fx.Tensor(fx.make_view(arg_scale_b, fx.make_layout(N, 1)))
+        bias_1d = fx.Tensor(fx.make_view(arg_bias, fx.make_layout(N, 1)))
 
         gx = (i32_m + (tile_m - 1)) // tile_m
         gy = (
@@ -990,13 +995,13 @@ def compile_preshuffle_gemm(
 
         kernel_gemm(
             arg_c_2d,
-            arg_out,
-            arg_semaphore,
+            arg_out_2d,
+            semaphore_1d,
             arg_a_2d,
             preshuffle_B,
-            arg_scale_a,
-            arg_scale_b,
-            arg_bias,
+            scale_a_1d,
+            scale_b_1d,
+            bias_1d,
             i32_m,
             i32_n,
             tiled_mma,

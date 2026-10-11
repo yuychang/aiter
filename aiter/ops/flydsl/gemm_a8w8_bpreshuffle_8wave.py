@@ -24,21 +24,21 @@ _I32_MAX = 2**31
 
 # Lazily bound flydsl symbols (kept out of the import path when flydsl is absent).
 _compile_fp8_gemm_8w = None
-_run_compiled = None
+_run_compiled_ptrs = None
 _fx = None
 
 
 def _lazy_import() -> None:
-    global _compile_fp8_gemm_8w, _run_compiled, _fx
+    global _compile_fp8_gemm_8w, _run_compiled_ptrs, _fx
     if _compile_fp8_gemm_8w is not None:
         return
     import flydsl.expr as fx_mod
 
     from .kernels.gemm_a8w8_8wave import compile_fp8_gemm_8w
-    from .kernels.tensor_shim import _run_compiled as run_compiled
+    from .kernels.tensor_shim import _run_compiled_ptrs as run_compiled_ptrs
 
     _compile_fp8_gemm_8w = compile_fp8_gemm_8w
-    _run_compiled = run_compiled
+    _run_compiled_ptrs = run_compiled_ptrs
     _fx = fx_mod
 
 
@@ -136,19 +136,13 @@ def _as_1d_fp32(scale: Tensor, length: int, name: str) -> Tensor:
     an undersized scale array would be read through a buffer descriptor, return
     zeros out of bounds, and silently produce a partially-zero result.
     """
-    flat = scale.reshape(-1)
-    if flat.numel() != length:
+    if scale.numel() != length:
         raise ValueError(
             f"[FlyDSL 8wave] {name} must have {length} elements, got {tuple(scale.shape)}"
         )
-    if flat.dtype != torch.float32:
-        flat = flat.to(torch.float32)
-    return flat.contiguous()
-
-
-def _as_i8(t: Tensor) -> Tensor:
-    """Bitcast fp8 storage to int8; ``make_fp8_buffer_tensor`` recasts the iterator."""
-    return t.view(torch.int8) if "float8" in str(t.dtype) else t
+    if scale.dtype != torch.float32:
+        scale = scale.to(torch.float32)
+    return scale.contiguous()
 
 
 def flydsl_8wave_gemm_a8(
@@ -219,20 +213,24 @@ def flydsl_8wave_gemm_a8(
     )
 
     out_contig = Out.contiguous()
+    xq_contig = XQ.contiguous()
+    wq_contig = WQ.contiguous()
     # NOTE: the 8-wave launcher takes (A, B_T, C, A_scale, B_scale, c_m, c_n,
     # stream) -- A first and C *third*. This is the opposite of the preshuffle
     # launcher's (C, A, B, ...), and getting it wrong yields a kernel that runs
     # happily and writes garbage.
-    _run_compiled(
+    _run_compiled_ptrs(
         exe,
-        _as_i8(XQ.contiguous()).view(-1),
-        _as_i8(WQ.contiguous()).view(-1),
-        out_contig.view(-1),
-        sa,
-        sb,
+        (
+            (xq_contig, _fx.Int8),
+            (wq_contig, _fx.Int8),
+            (out_contig, _fx.BFloat16),
+            (sa, _fx.Float32),
+            (sb, _fx.Float32),
+        ),
         M,
         N,
-        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+        torch.cuda.current_stream(device=XQ.device),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)
@@ -248,6 +246,7 @@ _KERNEL_NAME_RE = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=64)
 def parse_8wave_kernel_name(name: str) -> dict | None:
     """Parse a ``flydsl_bpreshuffle_8w_`` kernelName into its config dict, or None."""
     m = _KERNEL_NAME_RE.fullmatch(name)

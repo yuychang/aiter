@@ -21,7 +21,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
 )
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled_ptrs
 
 __all__ = [
     "SPLIT_K_SEMAPHORE_MAX_LEN",
@@ -376,39 +376,41 @@ def flydsl_preshuffle_gemm_a8(
         split_k=int(split_k),
     )
 
-    def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
-
     out_contig = Out.contiguous()
-    # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
-    # epilogue != "none"). Pass an empty tensor as a placeholder for the
-    # default epilogue="none" path.
-    dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    xq_contig = XQ.contiguous()
+    wq_contig = WQ.contiguous()
+    x_scale_contig = x_scale.contiguous()
+    w_scale_contig = w_scale.contiguous()
+    out_ptr_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
     if split_k > 1:
         _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
         workspace, semaphore = _get_preshuffle_split_buffers(
             Out.device, torch.cuda.current_stream(device=Out.device)
         )
+        workspace_ptr_type = fx.Float32
     else:
         workspace = out_contig
-        # dtype is part of the executable's cache signature, so this must match
-        # what the AOT pre-compile passes or every non-split-K kernel misses it.
-        semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
-    # The layout-API launcher takes fx.Tensor args, so pass flat tensors
-    # directly rather than raw pointers.
-    _run_compiled(
+        workspace_ptr_type = out_ptr_type
+        # Both are compile-time-dead when split_k == 1. Reuse an existing
+        # allocation so the hot path performs no torch.empty(0) calls.
+        semaphore = out_contig
+    stream = torch.cuda.current_stream(device=Out.device)
+    _run_compiled_ptrs(
         exe,
-        workspace.view(-1),
-        out_contig.view(-1),
-        semaphore,
-        _as_i8(XQ.contiguous()).view(-1),
-        _as_i8(WQ.contiguous()).view(-1),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
-        dummy_bias,
+        (
+            (workspace, workspace_ptr_type),
+            (out_contig, out_ptr_type),
+            (semaphore, fx.Int32),
+            (xq_contig, fx.Int8),
+            (wq_contig, fx.Int8),
+            (x_scale_contig, fx.Float32),
+            (w_scale_contig, fx.Float32),
+            # arg_bias is compile-time-dead for epilogue="none".
+            (out_contig, out_ptr_type),
+        ),
         m,
         n,
-        fx.Stream(torch.cuda.current_stream()),
+        stream,
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

@@ -144,6 +144,7 @@ def gemm_a8w8_bpreshuffle_cktile(
 ) -> Tensor: ...
 
 
+@functools.lru_cache(maxsize=256)
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
     waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split)``, or None on
@@ -200,8 +201,8 @@ def gemm_a8w8_bpreshuffle_flydsl(
     tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
 
     flydsl_preshuffle_gemm_a8(
-        XQ.contiguous(),
-        WQ.contiguous(),
+        XQ,
+        WQ,
         x_scale,
         w_scale,
         Out,
