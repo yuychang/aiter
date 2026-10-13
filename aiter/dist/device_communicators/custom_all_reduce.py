@@ -1266,7 +1266,7 @@ class CustomAllreduce:
         out: torch.Tensor | None = None,
         registered_input: bool = False,
     ):
-        """Out-of-place 1-stage all-reduce with a fused residual add.
+        """Out-of-place all-reduce with a fused residual add.
 
         ``residual`` must be identical on every rank. Uses the same 1-/2-stage
         crossover as plain custom all-reduce.
