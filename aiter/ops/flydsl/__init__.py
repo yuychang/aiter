@@ -134,6 +134,40 @@ _LAZY_IMPORTS = {
         ".linear_attention_kernels",
         "is_flydsl_kda_decode_supported",
     ),
+    "minimax_m3_index_score_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl",
+    ),
+    "minimax_m3_index_score_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported",
+    ),
+    "minimax_m3_index_score_alloc": (
+        ".kernels.minimax_m3_index_score",
+        "alloc_score",
+    ),
+    "minimax_m3_index_score_work_map": (
+        ".kernels.minimax_m3_index_score",
+        "build_work_map",
+    ),
+    "minimax_m3_index_score_work_map_capacity": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_capacity",
+    ),
+    "minimax_m3_index_score_work_map_size": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_size",
+    ),
+    "minimax_m3_index_score_prefill_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl",
+    ),
+    # Its own, not the decode scorer's: prefill's output is
+    # [heads, total_q, max_block] and is sized from the ragged batch.
+    "minimax_m3_index_score_prefill_alloc": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "alloc_score",
+    ),
 }
 
 __all__ = [
@@ -171,6 +205,14 @@ __all__ = [
     "gather_kv_b_proj_flydsl_supported",
     "is_flydsl_kda_decode_supported",
     "make_fp4_mqa_plan",
+    "minimax_m3_index_score_alloc",
+    "minimax_m3_index_score_flydsl",
+    "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_prefill_alloc",
+    "minimax_m3_index_score_prefill_flydsl",
+    "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_capacity",
+    "minimax_m3_index_score_work_map_size",
     "pa_decode",
     "prepare_pa_decode_plan",
 ]
