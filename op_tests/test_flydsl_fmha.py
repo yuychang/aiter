@@ -1950,13 +1950,19 @@ def test_fp8_public_varlen_descale_routes_to_flydsl():
 
 
 @_gfx950_only
-def test_fp8_public_varlen_descale_rejects_unsupported():
-    """Descales must not be dropped silently when the FlyDSL fp8 path declines."""
-    from aiter import flash_attn_varlen_func
+def test_fp8_public_varlen_descale_rejects_unsupported(monkeypatch):
+    """Descales must not be dropped silently when the FlyDSL fp8 path declines.
 
+    With CK the call falls back to the CK path, which takes the descales; without
+    CK only the descale-dropping Triton fallback is left, so it must raise.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", False)
     (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
     L = q.shape[0]
-    with pytest.raises(ValueError, match="flash_attn_varlen_fp8_pertensor_func"):
+    with pytest.raises(RuntimeError, match="requires ENABLE_CK=1.*sliding window"):
         flash_attn_varlen_func(
             q,
             k,

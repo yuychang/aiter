@@ -3482,6 +3482,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3513,9 +3516,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -3623,7 +3626,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # is_grad_enabled,
         # cu_seqlens_q_padded, cu_seqlens_k_padded,
         # is_v3_atomic_fp32, how_v3_bf16_cvt,
-        # sink_ptr (fwd-only sink scores; not differentiable via autograd.
+        # sink_ptr, q_descale, k_descale, v_descale
+        # (fwd-only inputs; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
@@ -3654,11 +3658,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
-def _varlen_descale_error(q, k, v, **gate_kwargs) -> ValueError:
-    """Error for q/k/v_descale the FlyDSL FP8 varlen path cannot honor.
+def _varlen_descale_reject_reason(q, k, v, **gate_kwargs) -> str:
+    """Why the FlyDSL FP8 varlen path cannot honor q/k/v_descale for this call.
 
     The reason comes from the FlyDSL FP8 gate itself so the two never drift.
     """
@@ -3671,12 +3678,7 @@ def _varlen_descale_error(q, k, v, **gate_kwargs) -> ValueError:
             if q.dim() != 3
             else "unsupported varlen configuration"
         )
-    return ValueError(
-        "flash_attn_varlen_func: q/k/v_descale are only supported on the "
-        f"FlyDSL FP8 path, which cannot serve this call ({reason}). Use "
-        "flash_attn_varlen_fp8_pertensor_func for per-tensor FP8 attention "
-        "with these options."
-    )
+    return reason
 
 
 def flash_attn_varlen_func(
@@ -3704,9 +3706,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
-    q_descale: Tensor | None = None,
-    k_descale: Tensor | None = None,
-    v_descale: Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3771,6 +3773,40 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    descales = (q_descale, k_descale, v_descale)
+    has_any_descale = any(descale is not None for descale in descales)
+    has_all_descales = all(descale is not None for descale in descales)
+
+    def descale_reject_reason():
+        return _varlen_descale_reject_reason(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink_ptr,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
+
+    # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
+    # descales, so reject them before any dispatch.
+    if has_any_descale and q.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "flash_attn_varlen_func: q/k/v_descale require FP8 inputs "
+            f"({descale_reject_reason()})"
+        )
+    if has_any_descale and not has_all_descales:
+        raise ValueError(
+            "FP8 attention requires q_descale, k_descale, and v_descale together"
+        )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3811,36 +3847,7 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    # Per-tensor descales are only honored by the FlyDSL FP8 path below.
-    has_descale = (
-        q_descale is not None or k_descale is not None or v_descale is not None
-    )
-
-    def descale_error():
-        return _varlen_descale_error(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            window_size=window_size,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            sink=sink_ptr,
-            return_attn_probs=return_attn_probs,
-            block_table=block_table,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            out=out,
-        )
-
-    # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
-    # descales, so reject them before any dispatch.
-    if has_descale and q.dtype != torch.float8_e4m3fn:
-        raise descale_error()
-
-    if not has_descale and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3868,11 +3875,16 @@ def flash_attn_varlen_func(
             True,
             how_v3_bf16_cvt,
             sink_ptr,
+            q_descale,
+            k_descale,
+            v_descale,
         )
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
+    # Per-tensor Q/K/V descales are consumed by the FlyDSL FP8 kernel; anything
+    # it declines falls back to the CK path, which also takes the descales.
     if len(window_size) < 3 or window_size[2] == 0:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
@@ -3903,10 +3915,15 @@ def flash_attn_varlen_func(
         if _flydsl_result is not None:
             return _flydsl_result
 
-    if has_descale:
-        # The CK/Triton fallbacks below do not take descales; running them would
+    if has_all_descales and not ENABLE_CK:
+        # The Triton fallback below does not take descales; running it would
         # silently drop the scales and return wrong results.
-        raise descale_error()
+        raise RuntimeError(
+            "prequantized FP8 attention with descales requires ENABLE_CK=1 when "
+            "the FlyDSL FP8 path cannot serve the call "
+            f"({descale_reject_reason()}). Use flash_attn_varlen_fp8_pertensor_func "
+            "for per-tensor FP8 attention with these options."
+        )
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
@@ -3961,6 +3978,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
