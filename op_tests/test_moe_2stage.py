@@ -1647,6 +1647,38 @@ def test_presorted_moe_wrapper_error():
     aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
 
 
+def test_presorted_moe_block_m():
+    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+
+    kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
+    so a registration labelled block_m=32 that matches the call must still be
+    ignored. CPU-only: checks the matcher fused_moe uses, no kernel launch.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+
+    def aux(block_m):
+        return {
+            "topk_ids_ptr": ids.data_ptr(),
+            "topk_weights_ptr": weights.data_ptr(),
+            "M": M,
+            "block_m": block_m,
+            "num_experts": E,
+            "topk": topk,
+        }
+
+    def match(block_m):
+        return fm._match_presorted_moe(
+            aux(block_m), ids, weights, block_m=block_m, num_experts=E, topk=topk
+        )
+
+    assert match(16) is not None, "a matching BM=16 presort was rejected"
+    assert match(32) is None, "a BM=32 presort was accepted"
+    aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1665,6 +1697,7 @@ if args.bm16_scale_boundary:
 else:
     test_output_buffer_contract()
     test_presorted_moe_wrapper_error()
+    test_presorted_moe_block_m()
     if get_gfx() == "gfx950":
         test_presorted_moe_hook()
     else:
