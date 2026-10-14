@@ -378,6 +378,7 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -392,7 +393,13 @@ def _adaptive_moe_sort(
         m_indices,
     ) = _alloc_aux_sort_buffers(M, num_experts, topk, BM, device)
     moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        # Atomic GEMM2 accumulates into moe_buf, so the caller's buffer can stand
+        # in for it; it is zeroed below like a fresh one.
+        (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
         if atomic
         else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     )
@@ -577,7 +584,7 @@ def _use_a8w4_fused_sort_quant(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (a4w4, atomic)          yes        output is the atomic moe_buf
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -599,18 +606,22 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
-def _validate_output_buffer_no_overlap(output, hidden_states):
+def _validate_output_buffer_no_overlap(output, **inputs):
     if output is None:
         return
-    # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
-        raise RuntimeError(
-            "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
-            "reads it"
-        )
+    # Accumulate mode zeroes the output rows at sort time, before the stages read
+    # any input, and atomic GEMM2 then writes into them while still reading.
+    for name, tensor in inputs.items():
+        if tensor is None:
+            continue
+        if (
+            output.data_ptr() < tensor.data_ptr() + tensor.nbytes
+            and tensor.data_ptr() < output.data_ptr() + output.nbytes
+        ):
+            raise RuntimeError(
+                f"output overlaps {name}, which moe_sorting zeroes before the MoE "
+                "stages read it"
+            )
 
 
 def _return_output(ret, output):
@@ -791,7 +802,8 @@ def _moe_sorting_impl(
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # `output` becomes the atomic moe_buf. Stage1 also receives it, but only
+        # to zero it, so the caller's buffer is safe to use here.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -802,6 +814,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -1200,8 +1213,8 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
     # Optional [M, model_dim] destination for the result, to save the caller a
-    # copy. Must be contiguous, match shape/dtype/device and not overlap
-    # hidden_states, or the call raises; when given it is what gets returned.
+    # copy. Must be contiguous, match shape/dtype/device and not overlap any
+    # input tensor, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
@@ -1541,7 +1554,30 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    _validate_output_buffer_no_overlap(
+        output,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        bias1=bias1,
+        bias2=bias2,
+        # FHMoE passes its shared-expert weights and scales through here.
+        **{
+            name: value
+            for extra in (_stage1_extra_args, _stage2_extra_args)
+            if extra
+            for name, value in extra.items()
+            if isinstance(value, torch.Tensor)
+        },
+    )
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
