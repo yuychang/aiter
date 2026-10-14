@@ -541,53 +541,61 @@ def fhmoe_(
     shared_expert_id: int = -1,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from aiter.fused_moe import _fused_moe_impl
+    from aiter.fused_moe import _fused_moe_impl, _pop_presorted_moe
 
-    activation_enum = ActivationType(activation)
-    quant_type_enum = QuantType(quant_type)
-    gate_mode_enum = GateMode(gate_mode)
-    _validate_fhmoe_contract(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        shared_w1,
-        shared_w2,
-        shared_w1_scale,
-        shared_w2_scale,
-        shared_expert_id,
-        activation_enum,
-        quant_type_enum,
-        gate_mode_enum,
-        expert_mask,
-        bias1,
-        bias2,
-    )
-    q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
-    experts = w1.shape[0]
-    model_dim = w2.shape[1]
-    inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
-    topk = topk_ids.shape[1]
-    metadata_config_file = None
-    if _is_dsv4_i384_fhmoe_contract(
-        model_dim,
-        inter_dim,
-        experts,
-        topk,
-        hidden_pad,
-        intermediate_pad,
-        gate_mode_enum,
-        doweight_stage1,
-    ):
-        if not supports_dsv4_i384_fhmoe(hidden_states.shape[0]):
-            raise NotImplementedError(
-                "The active FHMoE config does not cover this DSV4 I384 "
-                f"token shape: M={hidden_states.shape[0]}"
-            )
-        from aiter.jit.core import AITER_CONFIGS
+    try:
+        activation_enum = ActivationType(activation)
+        quant_type_enum = QuantType(quant_type)
+        gate_mode_enum = GateMode(gate_mode)
+        _validate_fhmoe_contract(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w2,
+            shared_w1_scale,
+            shared_w2_scale,
+            shared_expert_id,
+            activation_enum,
+            quant_type_enum,
+            gate_mode_enum,
+            expert_mask,
+            bias1,
+            bias2,
+        )
+        q_dtype_a = (
+            dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+        )
+        experts = w1.shape[0]
+        model_dim = w2.shape[1]
+        inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
+        topk = topk_ids.shape[1]
+        metadata_config_file = None
+        if _is_dsv4_i384_fhmoe_contract(
+            model_dim,
+            inter_dim,
+            experts,
+            topk,
+            hidden_pad,
+            intermediate_pad,
+            gate_mode_enum,
+            doweight_stage1,
+        ):
+            if not supports_dsv4_i384_fhmoe(hidden_states.shape[0]):
+                raise NotImplementedError(
+                    "The active FHMoE config does not cover this DSV4 I384 "
+                    f"token shape: M={hidden_states.shape[0]}"
+                )
+            from aiter.jit.core import AITER_CONFIGS
 
-        metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+            metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+    except BaseException:
+        # Rejected before _fused_moe_impl consumed a registered presort; drop it
+        # so it cannot apply to a later call on reused routing buffers.
+        _pop_presorted_moe()
+        raise
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
