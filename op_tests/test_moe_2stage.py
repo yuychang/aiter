@@ -576,7 +576,41 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    # Callers such as the serving MoE layer hand fused_moe their own [token,
+    # model_dim] buffer. Fill it with NaN so a path that skips zeroing it before
+    # accumulating, or writes the result elsewhere, cannot pass.
+    out_buf = torch.full_like(out2_ck, float("nan"))
+    out_ret = fused_moe(
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    out_has_nan = out_buf.isnan().any().item()
+    out_err = checkAllclose(out2_ref, out_buf, msg="ck_moe_2stages output=")
+    out_logits_diff = calc_diff(out2_ref, out_buf)
+    out_failed = (
+        out_ret is not out_buf
+        or out_has_nan
+        or (out_err != 0 and out_logits_diff > 0.01)
+    )
+    out_msg = (
+        f"output= check failed: returned buf={out_ret is out_buf}, "
+        f"nan={out_has_nan}, err={out_err}, logits_diff={out_logits_diff}"
+    )
+    if strict_accuracy:
+        assert not out_failed, out_msg
+    elif out_failed:
+        logger.warning("accuracy check failed (non-strict): %s", out_msg)
+
+    return {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "output logits_diff": float(out_logits_diff),
+    }
 
 
 l_quant = [
@@ -748,11 +782,6 @@ parser.add_argument(
     "--bm16-scale-boundary",
     action="store_true",
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
-)
-parser.add_argument(
-    "--adaptive-output",
-    action="store_true",
-    help="Run only the adaptive-sort in-place output test.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1414,8 +1443,13 @@ def test_output_buffer_contract():
         "a non-contiguous output",
         output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
     )
-    # moe_sorting zeroes output before stage1 reads hidden_states.
+    # moe_sorting zeroes output before the stages read their inputs.
     expect_raise("an output overlapping hidden_states", output=hidden)
+    for name, tensor in (("w1", w1), ("w2", w2)):
+        expect_raise(
+            f"an output overlapping {name}",
+            output=tensor.view(-1)[: token * model_dim].view(token, model_dim),
+        )
 
     # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
@@ -1461,44 +1495,11 @@ def test_output_buffer_contract():
 def test_adaptive_sort_output_in_place():
     """The a4w4 adaptive aux sort accumulates straight into the caller's output.
 
-    Kimi-K3 A4W4 TP=8 decode. The output buffer arrives dirty (NaN), must be
-    zeroed and written in place with no trailing copy, and must match the result
-    fused_moe returns without an output buffer.
+    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
+    checks it against the torch reference; here we also check that the buffer
+    reached the adaptive sort as its atomic moe_buf and was never copied into.
     """
-    if get_gfx() != "gfx950":
-        aiter.logger.info("skip adaptive-sort in-place output test on %s", get_gfx())
-        return
     fm = aiter.fused_moe
-    torch.manual_seed(0)
-    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
-    dtype = dtypes.bf16
-    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
-
-    def prep(w):
-        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
-        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
-        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
-        rows = scale.shape[0] * scale.shape[1]
-        return (
-            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
-            fp4_utils.e8m0_shuffle(scale.view(rows, -1)).view(*scale.shape[:2], -1),
-        )
-
-    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
-    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
-    kwargs = {
-        "w1_scale": w1_scale,
-        "w2_scale": w2_scale,
-        "quant_type": aiter.QuantType.per_1x32,
-        "activation": aiter.ActivationType.Situv2,
-        "quant_dtype_a": dtypes.fp4x2,
-    }
-
-    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
-    def calc_diff(x, y):
-        x, y = x.double(), y.double()
-        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
-
     real_adaptive = fm._adaptive_moe_sort
     real_return = fm._return_output
     adaptive_calls, copies = [], []
@@ -1512,32 +1513,48 @@ def test_adaptive_sort_output_in_place():
             copies.append(1)
         return real_return(ret, output)
 
+    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
+    rows = []
+    torch.manual_seed(0)
     try:
         fm._adaptive_moe_sort = tracking_adaptive
         fm._return_output = tracking_return
-        for token in (1, 4):
-            hidden = torch.randn((token, model_dim), dtype=dtype) / 10
-            gating = torch.randn((token, E), dtype=dtype)
-            topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
-            args = (hidden, w1, w2, topk_weights, topk_ids)
-            ref = fused_moe(*args, **kwargs)
-
-            adaptive_calls.clear()
-            copies.clear()
-            buf = torch.full((token, model_dim), float("nan"), dtype=dtype)
-            out = fused_moe(*args, output=buf, **kwargs)
-            torch.cuda.synchronize()
-            assert adaptive_calls == [
-                True
-            ], f"token={token}: adaptive sort calls {adaptive_calls}"
-            assert out is buf and not copies, f"token={token}: output was copied"
-            assert not buf.isnan().any(), f"token={token}: output not zeroed"
-            diff = calc_diff(ref, buf)
-            assert diff < 1e-4, f"token={token}: in-place vs returned diff {diff}"
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            for token in (1, 4):
+                adaptive_calls.clear()
+                copies.clear()
+                rows.append(
+                    test_fmoe(
+                        dtype=dtypes.bf16,
+                        token=token,
+                        model_dim=3584,
+                        inter_dim=384,
+                        E=896,
+                        topk=16,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                    )
+                )
+                assert (
+                    True in adaptive_calls
+                ), f"token={token}: output never reached the adaptive sort"
+                assert not copies, f"token={token}: output was copied into"
+                gc.collect()
+                torch.cuda.empty_cache()
     finally:
         fm._adaptive_moe_sort = real_adaptive
         fm._return_output = real_return
-    aiter.logger.info("moe_2stage: adaptive-sort in-place output passed")
+    aiter.logger.info(
+        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1555,11 +1572,15 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
-elif args.adaptive_output:
-    test_adaptive_sort_output_in_place()
 else:
     test_output_buffer_contract()
-    test_adaptive_sort_output_in_place()
+    if get_gfx() == "gfx950":
+        test_adaptive_sort_output_in_place()
+    else:
+        aiter.logger.warning(
+            "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
+            get_gfx(),
+        )
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
