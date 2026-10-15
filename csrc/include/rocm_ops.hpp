@@ -2608,6 +2608,7 @@ namespace py = pybind11;
           py::arg("weight"),                               \
           py::arg("epsilon"),                              \
           py::arg("use_sigmoid") = false,                  \
+          py::arg("round_to_input_dtype") = false,         \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \

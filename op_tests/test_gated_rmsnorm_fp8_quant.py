@@ -9,7 +9,7 @@ Both kernels compute per-head RMSNorm(x, weight, eps) * gate(z) over
 [num_tokens, num_heads * head_dim]:
 - gated_rmsnorm_fp8_group_quant: SiLU gate, one FP8 scale per (token, head).
 - gated_rmsnorm_fp8_per_token_quant: SiLU or sigmoid gate, one FP8 scale per
-  token.
+  token, optionally rounded through the input dtype before quantization.
 """
 
 import argparse
@@ -32,13 +32,18 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950"]  # warp_size=64 kernels
 HEAD_DIM = 128  # the only head_dim (and group size) the kernels support
 
-# Per-token gate modes: gate name -> use_sigmoid.
-GATES = {"silu": False, "sigmoid": True}
+# Per-token gate modes: (use_sigmoid, round_to_input_dtype).
+# "sigmoid_round" is Kimi-K3 KDA's output gate.
+GATES = {
+    "silu": (False, False),
+    "sigmoid": (True, False),
+    "sigmoid_round": (True, True),
+}
 
 
 def run_torch(x, z, weight, eps, quant_dtype, per_token, gate="silu"):
     """Reference that matches the fused kernels' fp32 math. Not timed."""
-    use_sigmoid = GATES[gate]
+    use_sigmoid, round_to_input_dtype = GATES[gate]
     fp8_max = torch.finfo(quant_dtype).max
     num_tokens = x.shape[0]
 
@@ -46,6 +51,8 @@ def run_torch(x, z, weight, eps, quant_dtype, per_token, gate="silu"):
     normed = x.float() * torch.rsqrt(variance + eps) * weight.float().view(1, 1, -1)
     z = z.float()
     gated = normed * (torch.sigmoid(z) if use_sigmoid else z * torch.sigmoid(z))
+    if round_to_input_dtype:
+        gated = gated.to(x.dtype).float()
 
     # Per-token: one scale over the flattened row. Group: one scale per head.
     gated = gated.reshape(num_tokens, -1) if per_token else gated
@@ -133,7 +140,7 @@ def test_gated_rmsnorm_fp8_group_quant(
 def test_gated_rmsnorm_fp8_per_token_quant(
     num_tokens, num_heads, dtype, gate, eps=1e-6
 ):
-    use_sigmoid = GATES[gate]
+    use_sigmoid, round_to_input_dtype = GATES[gate]
     x, z, weight = make_inputs(num_tokens, num_heads, dtype)
     ref, ref_scales = run_torch(x, z, weight, eps, dtypes.fp8, True, gate)
 
@@ -149,6 +156,7 @@ def test_gated_rmsnorm_fp8_per_token_quant(
         weight,
         eps,
         use_sigmoid,
+        round_to_input_dtype,
     )
     err = check_dequant("hip", ref, ref_scales, out, scales, groups=1)
 
@@ -231,7 +239,7 @@ def main():
         choices=list(GATES),
         default=list(GATES),
         help="""Per-token quant gate modes.
-    e.g.: -g silu sigmoid""",
+    e.g.: -g silu sigmoid_round""",
     )
     args = parser.parse_args()
 

@@ -35,6 +35,7 @@ def gated_rmsnorm_fp8_per_token_quant(
     weight: Tensor,
     epsilon: float,
     use_sigmoid: bool = False,
+    round_to_input_dtype: bool = False,
 ) -> None:
     """
     HIP kernel for fused Gated RMSNorm + FP8 per-token quantization.
@@ -47,6 +48,8 @@ def gated_rmsnorm_fp8_per_token_quant(
         weight: [head_dim] RMSNorm weight (bf16/fp16)
         epsilon: numerical stability epsilon
         use_sigmoid: If true, use sigmoid(z) instead of silu(z)
+        round_to_input_dtype: If true, round norm(x) * gate(z) through x's dtype
+            before quantization, like an unfused path that stores it (e.g. KDA)
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """

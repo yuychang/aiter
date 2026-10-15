@@ -60,6 +60,8 @@ void gated_rmsnorm_fp8_group_quant(
  *   weight: RMSNorm weight [head_dim] (bf16/fp16)
  *   epsilon: Small value for numerical stability
  *   use_sigmoid: If true, use sigmoid(z) instead of silu(z)
+ *   round_to_input_dtype: If true, round norm(x) * gate(z) through the input
+ *     dtype before quantization, like an unfused path that stores it (e.g. KDA)
  */
 void gated_rmsnorm_fp8_per_token_quant(
     aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
@@ -68,7 +70,8 @@ void gated_rmsnorm_fp8_per_token_quant(
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim] - gating tensor
     const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
-    bool use_sigmoid = false);
+    bool use_sigmoid = false,
+    bool round_to_input_dtype = false);
 
 
 } // namespace aiter

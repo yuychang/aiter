@@ -10,6 +10,8 @@
 #include "aiter_stream.h"
 #include "gated_rmsnorm_quant.h"
 
+#include <type_traits>
+
 namespace aiter {
 
 /**
@@ -339,8 +341,16 @@ void gated_rmsnorm_fp8_group_quant(
  * Constraints:
  * - ONLY supports head_dim=128 (RMSNorm group) and num_heads <= 128.
  * - AMD GPU: warp_size=64.
+ *
+ * ROUND_TO_INPUT rounds norm(x) * gate(z) through DTYPE_I before quantization,
+ * which matches an unfused path that stores the gated output (e.g. KDA).
  */
-template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, bool USE_SIGMOID = false>
+template <typename DTYPE_I,
+          typename DTYPE_O,
+          int GROUP_SIZE       = 128,
+          int THREAD_DATA_SIZE = 16,
+          bool USE_SIGMOID     = false,
+          bool ROUND_TO_INPUT  = false>
 __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
     DTYPE_O* __restrict__ out,           // [num_tokens, num_heads * head_dim]
     float* __restrict__ scale,           // [num_tokens]
@@ -437,6 +447,9 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
                 float silu_z = z_vals[i] * sigmoid_z;
                 gated_vals[i] = normed * silu_z;
             }
+            if constexpr (ROUND_TO_INPUT) {
+                gated_vals[i] = opus::cast<float>(opus::cast<DTYPE_I>(gated_vals[i]));
+            }
             local_max = fmaxf(local_max, fabsf(gated_vals[i]));
         }
     }
@@ -492,7 +505,7 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
     }
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, bool USE_SIGMOID>
+template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, bool USE_SIGMOID, bool ROUND_TO_INPUT>
 void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
     aiter_tensor_t& out,
     aiter_tensor_t& scale,
@@ -524,7 +537,7 @@ void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
     const int64_t z_token_stride = z.stride(0);
     const int64_t z_head_stride  = z.stride(1);
 
-    gated_rmsnorm_fp8_per_token_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, USE_SIGMOID>
+    gated_rmsnorm_fp8_per_token_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, USE_SIGMOID, ROUND_TO_INPUT>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
             reinterpret_cast<float*>(scale.data_ptr()),
@@ -550,7 +563,8 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& weight,   // [head_dim]
     double epsilon,
-    bool use_sigmoid)
+    bool use_sigmoid,
+    bool round_to_input_dtype)
 {
     AITER_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
     AITER_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
@@ -583,12 +597,20 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     AITER_CHECK(static_cast<int64_t>(scale.numel()) == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
 
     constexpr int thread_data_size = 16;
+    auto launch = [&](auto use_sigmoid_c, auto round_c) {
+        gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I,
+                                                        DTYPE_O,
+                                                        thread_data_size,
+                                                        decltype(use_sigmoid_c)::value,
+                                                        decltype(round_c)::value>(
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+    };
     if (use_sigmoid) {
-        gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, true>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+        round_to_input_dtype ? launch(std::true_type{}, std::true_type{})
+                             : launch(std::true_type{}, std::false_type{});
     } else {
-        gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, false>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+        round_to_input_dtype ? launch(std::false_type{}, std::true_type{})
+                             : launch(std::false_type{}, std::false_type{});
     }
 }
 
@@ -602,7 +624,8 @@ void gated_rmsnorm_fp8_per_token_quant(
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& weight,   // [head_dim]
     double epsilon,
-    bool use_sigmoid)
+    bool use_sigmoid,
+    bool round_to_input_dtype)
 {
     AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
     AITER_CHECK(z.is_gpu(), "Input z must be on CUDA device");
@@ -623,10 +646,10 @@ void gated_rmsnorm_fp8_per_token_quant(
 
     if (x.dtype() == AITER_DTYPE_bf16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::bf16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, use_sigmoid);
+            out, scale, x, z, weight, epsilon, use_sigmoid, round_to_input_dtype);
     } else if (x.dtype() == AITER_DTYPE_fp16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::fp16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, use_sigmoid);
+            out, scale, x, z, weight, epsilon, use_sigmoid, round_to_input_dtype);
     } else {
         AITER_CHECK(false, "Unsupported dtype combination. Input: ", AiterDtype_to_str(x.dtype()),
                     ", Output: ", AiterDtype_to_str(out.dtype()));
