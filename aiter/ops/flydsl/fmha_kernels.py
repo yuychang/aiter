@@ -306,7 +306,7 @@ def _fp8_gfx950_reject_reason(
     if q.dim() not in (3, 4) or k.dim() != q.dim() or v.dim() != q.dim():
         return "q/k/v must all be 3D (varlen) or 4D (batch)"
     # An empty q has nothing to launch, and the launcher rejects its zero LSE
-    # stride; CK returns the empty outputs.
+    # stride; the caller's other backend returns the empty outputs.
     if q.numel() == 0:
         return "q is empty"
     # Dense launches take the batch from q; a smaller k/v batch is read past its end.
@@ -374,7 +374,8 @@ def _fp8_gfx950_reject_reason(
         return "block_table is not supported"
     if return_attn_probs:
         return "return_attn_probs is not supported"
-    # The kernel would raise past the int32 flat dim; decline so CK can serve it.
+    # The kernel would raise past the int32 flat dim; decline so the caller can
+    # use another backend.
     return _fp8_flat_elems_reason(q, k, v, packed=bool(cu_seqlens) or q.dim() != 4)
 
 
