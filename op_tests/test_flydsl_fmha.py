@@ -1939,7 +1939,7 @@ def test_fp8_repeat_launch_is_bit_exact_under_load():
     assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
 
 
-def _fp8_public_varlen_inputs(seq_len=256, num_heads=4, head_dim=128):
+def _fp8_varlen_inputs(seq_len=256, num_heads=4, head_dim=128):
     torch.manual_seed(FP8_SEED)
     shape = (seq_len, num_heads, head_dim)
     q, qs = _fp8_quant(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 3)
@@ -1967,7 +1967,7 @@ def test_fp8_public_varlen_descale_routes_to_flydsl(monkeypatch):
     monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
     # Square 128/128 routes to CK by default; this test checks the FlyDSL kernel.
     monkeypatch.setattr(mha_module, "_prefer_flydsl_fp8_descale", lambda *a: True)
-    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    (q, k, v), (qs, ks, vs), cu = _fp8_varlen_inputs()
     L = q.shape[0]
     out = flash_attn_varlen_func(
         q, k, v, cu, cu, L, L, causal=True, q_descale=qs, k_descale=ks, v_descale=vs
@@ -1989,7 +1989,7 @@ def test_fp8_public_varlen_descale_rejects_unsupported(monkeypatch, window_size)
     from aiter.ops import mha as mha_module
 
     monkeypatch.setattr(mha_module, "ENABLE_CK", False)
-    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    (q, k, v), (qs, ks, vs), cu = _fp8_varlen_inputs()
     L = q.shape[0]
     with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
         flash_attn_varlen_func(
@@ -2019,7 +2019,7 @@ def test_fp8_gate_rejects_flat_dim_overflow(monkeypatch, layout):
     from aiter.ops.flydsl import fmha_kernels
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
-    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    (q, k, v), (qs, ks, vs), cu = _fp8_varlen_inputs()
     kw = {
         "softmax_scale": None,
         "dropout_p": 0.0,
@@ -2049,27 +2049,19 @@ def test_fp8_gate_rejects_flat_dim_overflow(monkeypatch, layout):
 
 
 @_gfx950_only
-def test_fp8_public_varlen_descale_overflow_falls_back_to_ck(monkeypatch):
-    """A descaled varlen call past the fp8 flat-dim bound reaches CK, not a raise."""
-    from aiter import flash_attn_varlen_func
-    from aiter.ops import mha as mha_module
+def test_fp8_varlen_fwd_declines_flat_dim_overflow(monkeypatch):
+    """Past the fp8 flat-dim bound the varlen entry returns None instead of raising."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
-    class _CkStub:
-        @staticmethod
-        def apply(*args):
-            return "ck"
-
-    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
-    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
-    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs(head_dim=192)
+    (q, k, v), (qs, ks, vs), cu = _fp8_varlen_inputs(head_dim=192)
     v = v[..., :128].contiguous()
     monkeypatch.setattr(fa, "_FP8_MAX_FLAT_ELEMS", q.numel())
     L = q.shape[0]
-    out = flash_attn_varlen_func(
+    out = flydsl_flash_attn_varlen_fwd(
         q, k, v, cu, cu, L, L, causal=True, q_descale=qs, k_descale=ks, v_descale=vs
     )
-    assert out == "ck"
+    assert out is None
 
 
 @pytest.mark.parametrize("enable_ck", [True, False])
@@ -2609,37 +2601,32 @@ def _fp8_misplaced_inputs(misplaced):
     return (q, k, v), s, kw
 
 
-@_needs_gpu
-@pytest.mark.parametrize("misplaced", ["out", "cu_seqlens_q", "cu_seqlens_k"])
-def test_public_varlen_descale_host_tensor_skips_flydsl(monkeypatch, misplaced):
-    """A CPU out/cu_seqlens never reaches the FlyDSL fp8 kernel as a host pointer.
-
-    The FlyDSL fp8 gate declines it and the call goes to CK, which rejects it with
-    CHECK_DEVICE. The arch check and both launches are stubbed, so any GPU runs it.
-    """
-    from aiter import flash_attn_varlen_func
-    from aiter.ops import mha as mha_module
+def _stub_gfx950_fp8_launch(monkeypatch, reason):
+    """Report gfx950 and accept the head config, but fail if the kernel launches."""
+    from aiter.jit.utils import chip_info
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
-    calls = []
-
-    class _CkStub:
-        @staticmethod
-        def apply(*args):
-            calls.append("ck")
-            return "ck"
-
-    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
-    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(fa, "flydsl_flash_attn_fp8_supported", lambda *a, **kw: True)
     monkeypatch.setattr(
-        fa,
-        "flydsl_flash_attn_fp8_func",
-        lambda *a, **kw: pytest.fail("a host tensor reached the FlyDSL fp8 kernel"),
+        fa, "flydsl_flash_attn_fp8_func", lambda *a, **kw: pytest.fail(reason)
     )
+
+
+@_needs_gpu
+@pytest.mark.parametrize("misplaced", ["out", "cu_seqlens_q", "cu_seqlens_k"])
+def test_fp8_varlen_fwd_declines_host_tensors(monkeypatch, misplaced):
+    """A CPU out/cu_seqlens never reaches the FlyDSL fp8 kernel as a host pointer.
+
+    The varlen entry returns None so the caller can use another backend. The arch
+    check and the launch are stubbed, so any GPU runs it.
+    """
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+
+    _stub_gfx950_fp8_launch(monkeypatch, "a host tensor reached the FlyDSL fp8 kernel")
     (q, k, v), s, kw = _fp8_misplaced_inputs(misplaced)
     L = q.shape[0]
-    out = flash_attn_varlen_func(
+    out = flydsl_flash_attn_varlen_fwd(
         q,
         k,
         v,
@@ -2653,8 +2640,7 @@ def test_public_varlen_descale_host_tensor_skips_flydsl(monkeypatch, misplaced):
         v_descale=s,
         out=kw["out"],
     )
-    assert out == "ck"
-    assert calls == ["ck"]
+    assert out is None
 
 
 def _fp8_mismatched_cu_inputs(case):
@@ -2682,40 +2668,24 @@ _MISMATCHED_CU_CASES = ["k_shorter", "q_shorter", "single_entry", "two_dim"]
 
 @_needs_gpu
 @pytest.mark.parametrize("case", _MISMATCHED_CU_CASES)
-def test_public_varlen_descale_mismatched_cu_seqlens_skips_flydsl(monkeypatch, case):
-    """cu_seqlens_q/k of unequal length (or not 1-D with >= 2 entries) skip FlyDSL.
+def test_fp8_varlen_fwd_declines_mismatched_cu_seqlens(monkeypatch, case):
+    """cu_seqlens_q/k of unequal length (or not 1-D with >= 2 entries) are declined.
 
     The kernel derives the batch from cu_seqlens_q and would read cu_seqlens_k out
-    of bounds; the gate declines so CK rejects it with CHECK_SHAPE. The arch check
-    and both launches are stubbed, so any GPU runs it.
+    of bounds, so the varlen entry returns None. The arch check and the launch are
+    stubbed, so any GPU runs it.
     """
-    from aiter import flash_attn_varlen_func
-    from aiter.ops import mha as mha_module
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
-    calls = []
-
-    class _CkStub:
-        @staticmethod
-        def apply(*args):
-            calls.append("ck")
-            return "ck"
-
-    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
-    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
-    monkeypatch.setattr(fa, "flydsl_flash_attn_fp8_supported", lambda *a, **kw: True)
-    monkeypatch.setattr(
-        fa,
-        "flydsl_flash_attn_fp8_func",
-        lambda *a, **kw: pytest.fail("mismatched cu_seqlens reached the FlyDSL kernel"),
+    _stub_gfx950_fp8_launch(
+        monkeypatch, "mismatched cu_seqlens reached the FlyDSL kernel"
     )
     (q, k, v), s, cu_q, cu_k = _fp8_mismatched_cu_inputs(case)
     L = q.shape[0]
-    out = flash_attn_varlen_func(
+    out = flydsl_flash_attn_varlen_fwd(
         q, k, v, cu_q, cu_k, L, L, causal=True, q_descale=s, k_descale=s, v_descale=s
     )
-    assert out == "ck"
-    assert calls == ["ck"]
+    assert out is None
 
 
 @_gfx950_only
@@ -2760,9 +2730,11 @@ _MISMATCHED_BATCH_CASES = [(2, 1, 1), (1, 2, 2), (2, 2, 1)]
 @_gfx950_only
 @pytest.mark.parametrize("bq, bk, bv", _MISMATCHED_BATCH_CASES)
 def test_fp8_dense_mismatched_batch_is_rejected(bq, bk, bv):
-    """The gate and the kernel entry refuse unequal dense q/k/v batches.
+    """The gate, the batch entry and the kernel entry refuse unequal dense batches.
 
     The kernel takes the batch from q, so a smaller k/v would be read past its end.
+    The gate names the batch check, the batch entry returns None so the caller can
+    use another backend, and the kernel entry raises.
     """
     from aiter.ops.flydsl import fmha_kernels
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
@@ -2788,6 +2760,12 @@ def test_fp8_dense_mismatched_batch_is_rejected(bq, bk, bv):
         v_descale=s,
     )
     assert reason is not None and "batch" in reason
+    assert (
+        fmha_kernels.flydsl_flash_attn_batch_fwd(
+            q, k, v, causal=True, q_descale=s, k_descale=s, v_descale=s
+        )
+        is None
+    )
     with pytest.raises(ValueError, match="batch"):
         flydsl_flash_attn_fp8_func(
             q, k, v, causal=True, q_descale=s, k_descale=s, v_descale=s
@@ -2795,43 +2773,14 @@ def test_fp8_dense_mismatched_batch_is_rejected(bq, bk, bv):
 
 
 @_gfx950_only
-def test_public_batch_fp8_descale_mismatched_batch_skips_flydsl(monkeypatch):
-    """A dense descale call whose k/v batch differs from q's goes to CK, not FlyDSL.
-
-    The shape is one the route otherwise sends to FlyDSL (see
-    test_public_batch_fp8_descale_route), so only the batch check keeps it off.
-    """
-    from aiter.ops import mha as mha_module
-    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
-
-    calls = []
-
-    def _ck_stub(q, k, v, *args, **kwargs):
-        calls.append("ck")
-        return torch.zeros(*q.shape[:-1], v.shape[-1]), None, None, None
-
-    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
-    monkeypatch.setattr(mha_module, "_FLYDSL_AVAILABLE", True)
-    monkeypatch.setattr(mha_module, "_flash_attn_forward", _ck_stub)
-    monkeypatch.setattr(
-        fa,
-        "flydsl_flash_attn_fp8_func",
-        lambda *a, **kw: pytest.fail("mismatched batch reached the FlyDSL kernel"),
-    )
-    (q, k, v), s = _fp8_dense_batch_inputs(2, 1, 1)
-    mha_module.flash_attn_fp8_pertensor_func(q, k, v, s, s, s, causal=True)
-    assert calls == ["ck"]
-
-
-@_gfx950_only
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("qk_hdim", [192, 128])
-def test_public_varlen_descale_empty_q_skips_flydsl(monkeypatch, return_lse, qk_hdim):
-    """An empty descaled varlen call goes to CK and returns empty outputs.
+def test_fp8_varlen_fwd_declines_empty_q(monkeypatch, return_lse, qk_hdim):
+    """An empty descaled varlen call returns None instead of launching.
 
     FlyDSL has nothing to launch and rejects the zero LSE stride of an empty q.
     """
-    from aiter import flash_attn_varlen_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
     monkeypatch.setattr(
@@ -2847,7 +2796,7 @@ def test_public_varlen_descale_empty_q_skips_flydsl(monkeypatch, return_lse, qk_
     v = torch.empty(0, H, 128, dtype=torch.float8_e4m3fn, device="cuda")
     s = torch.ones(1, dtype=torch.float32, device="cuda")
     cu = torch.zeros(2, dtype=torch.int32, device="cuda")
-    res = flash_attn_varlen_func(
+    res = flydsl_flash_attn_varlen_fwd(
         q,
         k,
         v,
@@ -2861,11 +2810,7 @@ def test_public_varlen_descale_empty_q_skips_flydsl(monkeypatch, return_lse, qk_
         v_descale=s,
         return_lse=return_lse,
     )
-    torch.cuda.synchronize()
-    out = res[0] if return_lse else res
-    assert out.shape == (0, H, 128)
-    if return_lse:
-        assert res[1].numel() == 0
+    assert res is None
 
 
 @_gfx950_only
@@ -2910,30 +2855,19 @@ def test_fp8_kernel_rejects_host_tensors(misplaced):
         ([256, 128], [0, 256]),  # zero-length kv entry
     ],
 )
-def test_fp8_varlen_equal_max_differing_lengths(
-    monkeypatch, causal, head_dim, vl_q, vl_kv
-):
+def test_fp8_varlen_equal_max_differing_lengths(causal, head_dim, vl_q, vl_kv):
     """Equal q/kv maxima with per-sequence q != kv lengths stay exact on FlyDSL.
 
-    The public route infers ``cross_seqlen`` from the maxima only, so these calls
+    The varlen entry infers ``cross_seqlen`` from the maxima only, so these calls
     compile CROSS_SEQLEN=False. Varlen masking reads each sequence's lengths from
     cu_seqlens; CROSS_SEQLEN only skips fully-masked causal q tiles, so the output
     must match the reference and be bitwise equal to the CROSS_SEQLEN=True build.
     """
-    from aiter import flash_attn_varlen_func
-    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
 
-    class _CkStub:
-        @staticmethod
-        def apply(*args):
-            pytest.fail("expected the FlyDSL fp8 route, got CK")
-
-    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
-    # Equal maxima route 128/128 to CK by default; this test checks the FlyDSL kernel.
-    monkeypatch.setattr(mha_module, "_prefer_flydsl_fp8_descale", lambda *a: True)
     assert max(vl_q) == max(vl_kv)
     H = 8
     torch.manual_seed(FP8_SEED)
@@ -2952,7 +2886,10 @@ def test_fp8_varlen_equal_max_differing_lengths(
     cu_kv = torch.tensor(cukv, dtype=torch.int32, device="cuda")
     descales = {"q_descale": qs, "k_descale": ks, "v_descale": vs}
     L = max(vl_q)
-    out = flash_attn_varlen_func(q, k, v, cu_q, cu_kv, L, L, causal=causal, **descales)
+    out = flydsl_flash_attn_varlen_fwd(
+        q, k, v, cu_q, cu_kv, L, L, causal=causal, **descales
+    )
+    assert out is not None, "gfx950 fp8 varlen must not fall through"
     cross = flydsl_flash_attn_fp8_func(
         q,
         k,
