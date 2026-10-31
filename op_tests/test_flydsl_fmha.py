@@ -2177,6 +2177,47 @@ def test_fp8_varlen_fwd_declines_mismatched_cu_seqlens(monkeypatch, case):
     assert out is None
 
 
+@_needs_gpu
+@pytest.mark.parametrize(
+    "arch, expect",
+    [
+        ("gfx942", "needs gfx950, got gfx942"),
+        ("gfx950", "unsupported head configuration"),
+    ],
+)
+def test_fp8_gate_reason_names_the_runtime_arch(monkeypatch, arch, expect):
+    """A declined head config names the arch that get_gfx_runtime() reports.
+
+    The config check is stubbed to decline, so any GPU runs it.
+    """
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
+    monkeypatch.setattr(fa, "flydsl_flash_attn_fp8_supported", lambda *a, **kw: False)
+    (q, k, v), (qs, ks, vs), cu = _fp8_varlen_inputs()
+    reason = fmha_kernels._fp8_gfx950_reject_reason(
+        q,
+        k,
+        v,
+        softmax_scale=None,
+        dropout_p=0.0,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        return_attn_probs=False,
+        block_table=None,
+        out=None,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        cu_seqlens=(cu, cu),
+    )
+    assert reason is not None and expect in reason, reason
+
+
 @_gfx950_only
 @pytest.mark.parametrize("case", _MISMATCHED_CU_CASES)
 def test_fp8_kernel_rejects_mismatched_cu_seqlens(case):
