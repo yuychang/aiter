@@ -295,7 +295,6 @@ def _fp8_gfx950_reject_reason(
     if q_descale is None:
         return "q_descale is required"
 
-    from ...jit.utils.chip_info import get_gfx_runtime
     from .kernels.flash_attn_func_fp8_gfx950 import (
         _fp8_config_reason,
         _fp8_flat_elems_reason,
@@ -303,54 +302,64 @@ def _fp8_gfx950_reject_reason(
         flydsl_flash_attn_fp8_supported,
     )
 
-    if q.dim() not in (3, 4) or k.dim() != q.dim() or v.dim() != q.dim():
+    # The entries call this on every eager launch, so each check runs once and
+    # q.device is built once.
+    ndim = q.dim()
+    if ndim not in (3, 4) or k.dim() != ndim or v.dim() != ndim:
         return "q/k/v must all be 3D (varlen) or 4D (batch)"
     # An empty q has nothing to launch, and the launcher rejects its zero LSE
     # stride; the caller's other backend returns the empty outputs.
     if q.numel() == 0:
         return "q is empty"
     # Dense launches take the batch from q; a smaller k/v batch is read past its end.
-    if q.dim() == 4 and not (q.shape[0] == k.shape[0] == v.shape[0]):
+    if ndim == 4 and not (q.shape[0] == k.shape[0] == v.shape[0]):
         return (
             f"q/k/v batch sizes must match, got {q.shape[0]}/{k.shape[0]}/{v.shape[0]}"
         )
-    if not (k.dtype == v.dtype == torch.float8_e4m3fn):
+    if not (k.dtype is torch.float8_e4m3fn and v.dtype is torch.float8_e4m3fn):
         return f"q/k/v must be float8_e4m3fn, got k {k.dtype}, v {v.dtype}"
-    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
-        return "out must be a contiguous bfloat16 tensor"
-    if not (q.is_cuda and k.device == q.device and v.device == q.device):
+    dev = q.device
+    if not (q.is_cuda and k.device == dev and v.device == dev):
         return "q/k/v must be on the same GPU"
-    if out is not None and out.device != q.device:
-        return f"out must be on q's device {q.device}, got {out.device}"
-    if any(
-        not torch.is_tensor(cu)
-        or cu.device != q.device
-        or cu.dtype != torch.int32
-        or not cu.is_contiguous()
-        for cu in cu_seqlens
+    if out is not None and (
+        out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.device != dev
     ):
-        return "cu_seqlens_q/k must be contiguous int32 tensors on q's device"
-    if cu_seqlens and (
-        any(cu.dim() != 1 or cu.numel() < 2 for cu in cu_seqlens)
-        or len({cu.numel() for cu in cu_seqlens}) != 1
-    ):
-        return "cu_seqlens_q/k must be 1-D with equal lengths and at least 2 entries"
-    if any(
-        s is None
-        or not torch.is_tensor(s)
-        or s.dtype != torch.float32
-        or s.numel() != 1
-        or s.device != q.device
-        for s in (q_descale, k_descale, v_descale)
-    ):
-        return "q/k/v_descale must be 1-element float32 tensors on q's device"
+        return f"out must be a contiguous bfloat16 tensor on q's device {dev}"
+    if cu_seqlens:
+        cu_q, cu_k = cu_seqlens
+        if not (
+            isinstance(cu_q, torch.Tensor)
+            and isinstance(cu_k, torch.Tensor)
+            and cu_q.device == dev
+            and cu_k.device == dev
+            and cu_q.dtype is torch.int32
+            and cu_k.dtype is torch.int32
+            and cu_q.is_contiguous()
+            and cu_k.is_contiguous()
+        ):
+            return "cu_seqlens_q/k must be contiguous int32 tensors on q's device"
+        num_cu = cu_q.numel()
+        if cu_q.dim() != 1 or cu_k.dim() != 1 or num_cu < 2 or cu_k.numel() != num_cu:
+            return (
+                "cu_seqlens_q/k must be 1-D with equal lengths and at least 2 entries"
+            )
+    for s in (q_descale, k_descale, v_descale):
+        if (
+            not isinstance(s, torch.Tensor)
+            or s.dtype is not torch.float32
+            or s.numel() != 1
+            or s.device != dev
+        ):
+            return "q/k/v_descale must be 1-element float32 tensors on q's device"
     qk_hdim = q.shape[-1]
     if not _is_valid_softmax_scale(softmax_scale):
         return f"softmax_scale must be None or positive and finite, got {softmax_scale}"
     nq, nkv = q.shape[-2], k.shape[-2]
     if not flydsl_flash_attn_fp8_supported(
-        q.device, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
+        dev, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
     ):
+        from ...jit.utils.chip_info import get_gfx_runtime
+
         arch = get_gfx_runtime()
         if arch != "gfx950":
             return f"the FlyDSL FP8 kernel needs gfx950, got {arch or 'unknown'}"
@@ -362,7 +371,7 @@ def _fp8_gfx950_reject_reason(
         return "num_heads must be divisible by positive num_kv_heads"
     if dropout_p != 0.0:
         return "dropout is not supported"
-    if any(w >= 0 for w in window_size[:2]) or (
+    if max(window_size[:2], default=-1) >= 0 or (
         len(window_size) > 2 and window_size[2] != 0
     ):
         return f"sliding window / sink tokens are not supported, got {window_size=}"
@@ -376,12 +385,7 @@ def _fp8_gfx950_reject_reason(
         return "return_attn_probs is not supported"
     # The kernel would raise past the int32 flat dim; decline so the caller can
     # use another backend.
-    return _fp8_flat_elems_reason(q, k, v, packed=bool(cu_seqlens) or q.dim() != 4)
-
-
-def _fp8_gfx950_supported(q, k, v, **kwargs) -> bool:
-    """Gate for the gfx950 fp8 kernel; see :func:`_fp8_gfx950_reject_reason`."""
-    return _fp8_gfx950_reject_reason(q, k, v, **kwargs) is None
+    return _fp8_flat_elems_reason(q, k, v, packed=bool(cu_seqlens) or ndim != 4)
 
 
 def flydsl_flash_attn_varlen_fwd(
@@ -420,7 +424,7 @@ def flydsl_flash_attn_varlen_fwd(
         if (
             q.dtype is torch.float8_e4m3fn
             and q.dim() == 3
-            and _fp8_gfx950_supported(
+            and _fp8_gfx950_reject_reason(
                 q,
                 k,
                 v,
@@ -438,6 +442,7 @@ def flydsl_flash_attn_varlen_fwd(
                 out=out,
                 cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
             )
+            is None
         ):
             from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
 
@@ -560,7 +565,7 @@ def flydsl_flash_attn_batch_fwd(
         if (
             q.dtype is torch.float8_e4m3fn
             and q.dim() == 4
-            and _fp8_gfx950_supported(
+            and _fp8_gfx950_reject_reason(
                 q,
                 k,
                 v,
@@ -577,6 +582,7 @@ def flydsl_flash_attn_batch_fwd(
                 v_descale=v_descale,
                 out=out,
             )
+            is None
         ):
             from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
 

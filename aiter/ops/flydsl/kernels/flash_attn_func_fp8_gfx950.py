@@ -462,35 +462,41 @@ def flydsl_flash_attn_fp8_func(
             "flydsl_flash_attn_fp8_func: cu_seqlens_q required when cu_seqlens_kv is given"
         )
 
-    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_kv", cu_seqlens_kv)):
-        if cu is not None and (
-            cu.device != q.device or cu.dtype != torch.int32 or not cu.is_contiguous()
-        ):
-            raise ValueError(
-                f"flydsl_flash_attn_fp8_func: {name} must be a contiguous int32 tensor "
-                f"on {q.device}, got {cu.dtype} on {cu.device}"
-            )
-    if varlen and (
-        cu_seqlens_q.dim() != 1
-        or cu_seqlens_kv.dim() != 1
-        or cu_seqlens_q.numel() < 2
-        or cu_seqlens_q.numel() != cu_seqlens_kv.numel()
-    ):
-        raise ValueError(
-            "flydsl_flash_attn_fp8_func: cu_seqlens_q/cu_seqlens_kv must be 1-D [B+1] "
-            f"with B >= 1 and equal lengths, got {tuple(cu_seqlens_q.shape)} and "
-            f"{tuple(cu_seqlens_kv.shape)}"
-        )
-
     if varlen:
         if q.dim() != 3:
             raise ValueError(
                 f"flydsl_flash_attn_fp8_func: varlen q must be 3D [total,H,D], got {q.dim()}D"
             )
+        dev = q.device
+        if (
+            cu_seqlens_q.device != dev
+            or cu_seqlens_kv.device != dev
+            or cu_seqlens_q.dtype is not torch.int32
+            or cu_seqlens_kv.dtype is not torch.int32
+            or not cu_seqlens_q.is_contiguous()
+            or not cu_seqlens_kv.is_contiguous()
+        ):
+            raise ValueError(
+                "flydsl_flash_attn_fp8_func: cu_seqlens_q/cu_seqlens_kv must be "
+                f"contiguous int32 tensors on {dev}, got {cu_seqlens_q.dtype} on "
+                f"{cu_seqlens_q.device} and {cu_seqlens_kv.dtype} on {cu_seqlens_kv.device}"
+            )
+        num_cu = cu_seqlens_q.numel()
+        if (
+            cu_seqlens_q.dim() != 1
+            or cu_seqlens_kv.dim() != 1
+            or num_cu < 2
+            or cu_seqlens_kv.numel() != num_cu
+        ):
+            raise ValueError(
+                "flydsl_flash_attn_fp8_func: cu_seqlens_q/cu_seqlens_kv must be 1-D "
+                f"[B+1] with B >= 1 and equal lengths, got {tuple(cu_seqlens_q.shape)} "
+                f"and {tuple(cu_seqlens_kv.shape)}"
+            )
         _total_q, H, D = q.shape
         Hkv = k.shape[1]
         Skv = None
-        B = cu_seqlens_q.numel() - 1
+        B = num_cu - 1
         if max_seqlen_q is None:
             raise ValueError(
                 "flydsl_flash_attn_fp8_func: max_seqlen_q is required in varlen mode"
